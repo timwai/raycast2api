@@ -1,6 +1,7 @@
 # ---- build stage ----
 # Full `rust` image (not -slim) so the C toolchain that `ring` needs is present.
-FROM rust:1 AS builder
+# Match the runtime's glibc so the release binary runs on Bookworm.
+FROM rust:1-bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release --locked
