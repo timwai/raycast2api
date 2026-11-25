@@ -181,6 +181,7 @@ class AccountConsole extends LitElement {
         this.panel = panel;
         await this.updateComplete;
         if (!this.authenticated || this.panel !== panel) return;
+        if (panel === 'accounts') this.querySelector('accounts-panel')?.load();
         if (panel === 'proxy') this.querySelector('proxy-panel')?.load();
         if (panel === 'api-keys') this.querySelector('api-keys-panel')?.load();
         if (panel === 'logs') this.querySelector('logs-panel').load();
@@ -274,7 +275,7 @@ class AccountConsole extends LitElement {
                 @manage-account-proxy=${event => this.querySelector('proxy-binding-dialog')?.open(event.detail.email)}
             ></accounts-panel>
             <proxy-binding-dialog .request=${(path, body, resource = 'proxy') => this.request(path, body, resource)} @binding-updated=${() => this.querySelector('accounts-panel')?.load()}></proxy-binding-dialog>
-            <proxy-panel class="min-h-0 flex-1 overflow-hidden ${this.panel === 'proxy' ? 'block' : 'hidden'}" ?inert=${this.panel !== 'proxy'} .request=${(path, body) => this.request(path, body, 'proxy')}></proxy-panel>
+            <proxy-panel class="min-h-0 flex-1 overflow-hidden ${this.panel === 'proxy' ? 'block' : 'hidden'}" ?inert=${this.panel !== 'proxy'} .request=${(path, body) => this.request(path, body, 'proxy')} @proxy-tests-updated=${() => this.querySelector('accounts-panel')?.load()}></proxy-panel>
             <logs-panel
                 class="min-h-0 flex-1 overflow-hidden ${this.panel === 'logs' ? 'block' : 'hidden'}"
                 ?inert=${this.panel !== 'logs'}

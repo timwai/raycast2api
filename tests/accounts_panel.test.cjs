@@ -95,3 +95,19 @@ test('a failed priority save restores the stored value and releases all cards', 
     assert.equal(panel.workingEmail, '');
     assert.deepEqual(busyStates(panel.render()), [false]);
 });
+
+function renderedText(value) {
+    if (Array.isArray(value)) return Array.from(value).map(renderedText).join('');
+    if (value?.parts) return value.parts.map((part, index) => part + renderedText(value.values[index])).join('');
+    return value == null || typeof value === 'function' || typeof value === 'object' ? '' : String(value);
+}
+
+test('account cards warn about a failed bound proxy and clear the warning after a passing retest', () => {
+    const card = mount('account-card');
+    card.account = { email: 'proxy@fixture', available: true, proxy_binding: { node_id: 'node', test_status: 'failed', status: 'active', delay_checked_at: 100 } };
+    assert.match(renderedText(card.render()), /代理节点测试失败，请重测或更换出口/);
+    card.account.proxy_binding.test_status = 'passed';
+    assert.doesNotMatch(renderedText(card.render()), /代理节点测试失败/);
+    card.account.proxy_binding = null;
+    assert.doesNotMatch(renderedText(card.render()), /代理节点测试失败/);
+});
