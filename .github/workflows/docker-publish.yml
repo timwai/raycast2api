@@ -38,6 +38,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run gateway tests
+        run: cargo test --locked
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run dashboard tests
+        run: node --test tests/*test.cjs
+
+      - name: Fetch verified Mihomo core
+        env:
+          TARGETARCH: ${{ matrix.arch }}
+          MIHOMO_OUTPUT: ${{ runner.temp }}/mihomo
+        run: python3 build/fetch-mihomo.py
+
+      - name: Verify account routing against real Mihomo
+        env:
+          MIHOMO_TEST_BINARY: ${{ runner.temp }}/mihomo
+          MIHOMO_BINARY: ${{ runner.temp }}/mihomo
+        run: |
+          cargo test --locked real_core_binding -- --ignored --nocapture
+          python3 tests/proxy/mihomo_contract.py
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:

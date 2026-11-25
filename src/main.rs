@@ -84,6 +84,12 @@ async fn run() -> Result<(), String> {
     .with_redis(redis);
     let state = Arc::new(state);
     state
+        .proxy_manager
+        .start()
+        .await
+        .map_err(|e| format!("proxy manager initialization failed: {e}"))?;
+    let client = state.transport_client();
+    state
         .statistics
         .interrupt_unfinished()
         .expect("failed to recover unfinished statistics");
@@ -132,16 +138,20 @@ async fn run() -> Result<(), String> {
         }
     }
 
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let mut servers = tokio::task::JoinSet::new();
     for listener in listeners {
         let app = app.clone();
+        let proxy_manager = state.proxy_manager.clone();
         servers.spawn(async move {
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                proxy_manager.shutdown().await;
+            })
             .await
         });
     }
@@ -151,6 +161,7 @@ async fn run() -> Result<(), String> {
             .map_err(|err| format!("server task failed: {err}"))?
             .map_err(|err| format!("server error: {err}"))?;
     }
+    state.proxy_manager.shutdown().await;
     Ok(())
 }
 

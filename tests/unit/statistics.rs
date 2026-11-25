@@ -167,9 +167,12 @@ async fn costs_settle_before_terminal_delta_and_survive_response_peeking() {
         "m",
         false,
     );
-    let events = state
-        .dispatcher
-        .events(response, upstream, state.log.clone(), context);
+    let events = state.dispatcher.events(
+        crate::raycast::client::AccountResponse::new(response, &state.dispatcher.client),
+        upstream,
+        state.log.clone(),
+        context,
+    );
     let mut events = Box::pin(events);
     assert_eq!(
         events.next().await,
@@ -206,7 +209,10 @@ async fn cancellation_records_unknown_usage_before_and_during_stream_polling() {
             false,
         );
         let mut events = Box::pin(state.dispatcher.events(
-            response(attempt, &[json!({"text":"partial"})]),
+            crate::raycast::client::AccountResponse::new(
+                response(attempt, &[json!({"text":"partial"})]),
+                &state.dispatcher.client,
+            ),
             upstream,
             state.log.clone(),
             context,
@@ -248,7 +254,10 @@ async fn successful_finish_without_usage_remains_null_and_partial_usage_survives
             false,
         );
         let mut events = Box::pin(state.dispatcher.events(
-            response(attempt, &[payload]),
+            crate::raycast::client::AccountResponse::new(
+                response(attempt, &[payload]),
+                &state.dispatcher.client,
+            ),
             upstream,
             state.log.clone(),
             context,

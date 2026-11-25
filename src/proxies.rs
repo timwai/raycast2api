@@ -199,6 +199,19 @@ fn redact(url: &str) -> String {
     )
 }
 
+/// A fixed account listener, with environment proxy discovery disabled.
+pub(crate) fn bound_client(
+    port: u16,
+    timeout: std::time::Duration,
+    transport: Transport,
+) -> Result<Client, reqwest::Error> {
+    base_builder(timeout, transport)
+        .no_proxy()
+        .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))?)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

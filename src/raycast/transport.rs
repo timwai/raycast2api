@@ -17,7 +17,18 @@ impl RaycastClient {
             super::client::Transport::ChatFetch => (&self.chat_http, &self.chat_proxies),
             super::client::Transport::Got => (&self.http, &self.proxies),
         };
-        let channels = crate::proxies::channels(self.settings.proxies_mode, direct, proxies);
+        if let Some(lease) = &self.transport_lease {
+            lease.check()?;
+        }
+        let bound = self
+            .transport_lease
+            .as_ref()
+            .is_some_and(|lease| lease.bound());
+        let channels = if bound {
+            vec![("account_proxy", direct)]
+        } else {
+            crate::proxies::channels(self.settings.proxies_mode, direct, proxies)
+        };
         let mut last = None;
         let body_bytes = request
             .body()
@@ -85,7 +96,14 @@ impl RaycastClient {
                         "→ upstream send failed: {}",
                         crate::error::error_chain(&error)
                     );
-                    last = Some(GatewayError::from(error));
+                    last = Some(if bound {
+                        crate::proxy_manager::error(
+                            "proxy_connect_failed",
+                            "account proxy request failed; no alternative route was attempted",
+                        )
+                    } else {
+                        GatewayError::from(error)
+                    });
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -95,9 +113,16 @@ impl RaycastClient {
                         body_bytes,
                         "→ upstream send failed: response header timeout"
                     );
-                    last = Some(GatewayError::Upstream {
-                        status: 504,
-                        message: "upstream response header timeout".into(),
+                    last = Some(if bound {
+                        crate::proxy_manager::error(
+                            "proxy_connect_failed",
+                            "account proxy response header timeout; no alternative route was attempted",
+                        )
+                    } else {
+                        GatewayError::Upstream {
+                            status: 504,
+                            message: "upstream response header timeout".into(),
+                        }
                     });
                 }
             }
@@ -113,7 +138,15 @@ impl RaycastClient {
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, GatewayError> {
         // OAuth 轮换不可重放:只用一个通道。direct 走直连,其余模式用首个代理。
+        if let Some(lease) = &self.transport_lease {
+            lease.check()?;
+        }
+        let bound = self
+            .transport_lease
+            .as_ref()
+            .is_some_and(|lease| lease.bound());
         let http = match self.settings.proxies_mode {
+            _ if bound => &self.http,
             ProxyMode::Direct => &self.http,
             _ => self
                 .proxies
@@ -133,7 +166,16 @@ impl RaycastClient {
             .timeout(self.settings.upstream_timeout())
             .build()?;
         // OAuth rotation cannot safely replay after an ambiguous transport failure.
-        Ok(http.execute(request).await?)
+        http.execute(request).await.map_err(|e| {
+            if bound {
+                crate::proxy_manager::error(
+                    "proxy_connect_failed",
+                    "OAuth proxy transport failed; rotation was not replayed",
+                )
+            } else {
+                e.into()
+            }
+        })
     }
 
     /// All non-chat endpoints: got pipeline (HTTP/1.1-only clients).

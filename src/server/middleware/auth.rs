@@ -8,6 +8,17 @@ use crate::key::invalid_key;
 
 use super::super::state::SharedState;
 
+/// Opaque identity derived only after authentication, never from a client-supplied scope.
+#[derive(Clone)]
+pub struct ManagementIdentity(pub String);
+fn management_identity(kind: &str, credential: &str) -> ManagementIdentity {
+    use sha2::Digest;
+    ManagementIdentity(format!(
+        "{kind}:{}",
+        hex::encode(sha2::Sha256::digest(credential.as_bytes()))
+    ))
+}
+
 /// Management accepts a configured API key or a dashboard session. Inference
 /// keeps API-key authentication and never accepts a dashboard cookie.
 ///
@@ -27,11 +38,15 @@ pub async fn auth(
 
     let key = extract_api_key(request.headers());
     if key.as_deref() == Some(state.settings.api_key.as_str()) {
+        request
+            .extensions_mut()
+            .insert(management_identity("api_key", &state.settings.api_key));
         return Ok(next.run(request).await);
     }
 
     let is_management = [
         "/v1/accounts/",
+        "/v1/proxy/",
         "/v1/logs/",
         "/v1/models/",
         "/v1/statistics/",
@@ -48,6 +63,11 @@ pub async fn auth(
         }
         // Keep the session's own "登录已失效/已过期，请重新登录" message.
         crate::server::session::verify(&state, request.headers()).await?;
+        let identity = management_identity(
+            "session",
+            crate::server::session::cookie_token(request.headers()).unwrap_or_default(),
+        );
+        request.extensions_mut().insert(identity);
     } else if matches!(
         (request.method(), path),
         (

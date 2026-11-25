@@ -41,20 +41,20 @@ fn premature_error() -> CanonicalEvent {
 /// kept separate from `response` because the image CDN is a different host
 /// and must respect the same proxy policy as the chat request.
 /// `resend` re-issues the identical upstream request on retry.
-pub(crate) fn canonical_events_with_retry(
-    response: reqwest::Response,
+pub(crate) fn canonical_account_events_with_retry(
+    response: super::client::AccountResponse,
     log: Arc<RequestLogStore>,
     timeout: std::time::Duration,
-    fetch_clients: Vec<reqwest::Client>,
-    resend: impl FnOnce() -> BoxFuture<'static, Result<reqwest::Response, GatewayError>>
+    resend: impl FnOnce() -> BoxFuture<'static, Result<super::client::AccountResponse, GatewayError>>
     + Send
     + 'static,
 ) -> impl Stream<Item = CanonicalEvent> + Send + 'static {
     let id = debug::current_request_id();
-    let first = decode_events(response, log.clone(), timeout, fetch_clients.clone());
+    let bound = response.lease.as_ref().is_some_and(|lease| lease.bound());
+    let first = decode_account_events(response, log.clone(), timeout);
     stream! {
         let mut output_started = false;
-        let mut first = std::pin::pin!(first);
+        let mut first = Box::pin(first);
         let mut truncated = false;
         while let Some(result) = first.next().await {
             match result {
@@ -67,7 +67,9 @@ pub(crate) fn canonical_events_with_retry(
                 Err(()) => { truncated = true; break; }
             }
         }
+        drop(first);
         if !truncated { return; }
+        if bound { yield premature_error(); return; }
         // Replaying generation cannot reliably reproduce text, reasoning, signatures or tool calls.
         if output_started {
             tracing::warn!("upstream SSE truncated after output started [{id}] — preserving partial output, not retrying");
@@ -89,7 +91,7 @@ pub(crate) fn canonical_events_with_retry(
                 return;
             }
         };
-        let retry = debug::REQUEST_ID.scope(id.clone(), async { decode_events(response, log, timeout, fetch_clients) }).await;
+        let retry = debug::REQUEST_ID.scope(id.clone(), async { decode_account_events(response, log, timeout) }).await;
         let mut retry = std::pin::pin!(retry);
         while let Some(result) = retry.next().await {
             let event = match result {
@@ -113,6 +115,61 @@ pub(crate) fn canonical_events_with_retry(
             yield event;
             if terminal { return; }
         }
+    }
+}
+
+#[cfg(test)]
+fn canonical_events_with_retry(
+    response: reqwest::Response,
+    log: Arc<RequestLogStore>,
+    timeout: std::time::Duration,
+    fetch_clients: Vec<reqwest::Client>,
+    resend: impl FnOnce() -> BoxFuture<'static, Result<reqwest::Response, GatewayError>>
+    + Send
+    + 'static,
+) -> impl Stream<Item = CanonicalEvent> + Send + 'static {
+    let retry_clients = fetch_clients.clone();
+    canonical_account_events_with_retry(
+        super::client::AccountResponse {
+            response,
+            fetch_clients,
+            lease: None,
+        },
+        log,
+        timeout,
+        move || {
+            Box::pin(async move {
+                Ok(super::client::AccountResponse {
+                    response: resend().await?,
+                    fetch_clients: retry_clients,
+                    lease: None,
+                })
+            })
+        },
+    )
+}
+
+fn decode_account_events(
+    response: super::client::AccountResponse,
+    log: Arc<RequestLogStore>,
+    timeout: std::time::Duration,
+) -> impl Stream<Item = Result<CanonicalEvent, ()>> + Send + 'static {
+    let id = debug::current_request_id();
+    stream! {
+        let super::client::AccountResponse { response, fetch_clients, lease } = response;
+        let strict = lease.as_ref().is_some_and(|lease|lease.bound());
+        let events = debug::REQUEST_ID.scope(id, async { decode_events(response, log, timeout, fetch_clients, strict) }).await;
+        let mut events = std::pin::pin!(events);
+        loop {
+            let next = if let Some(lease) = &lease {
+                tokio::select! {
+                    _ = lease.cancelled() => { yield Ok(CanonicalEvent::Error { status:503, message:"request interrupted for proxy configuration update".into() }); return; },
+                    next = events.next() => next,
+                }
+            } else { events.next().await };
+            match next { Some(event) => yield event, None => break }
+        }
+        drop(lease);
     }
 }
 
@@ -194,6 +251,7 @@ fn decode_events(
     log: Arc<RequestLogStore>,
     timeout: std::time::Duration,
     fetch_clients: Vec<reqwest::Client>,
+    strict: bool,
 ) -> impl Stream<Item = Result<CanonicalEvent, ()>> + Send + 'static {
     // Grab the correlation id *here*: the task-local REQUEST_ID scope is only
     // valid inside the handler, while the stream below is polled outside it.
@@ -309,6 +367,10 @@ fn decode_events(
                                     )));
                                 }
                                 Err(error) => {
+                                    if strict {
+                                        yield Ok(CanonicalEvent::Error { status:503, message:"generated image could not be downloaded through the bound account proxy".into() });
+                                        return;
+                                    }
                                     tracing::warn!(
                                         "→ image fetch failed [{id}], falling back to raw URL: {error}"
                                     );
@@ -411,6 +473,62 @@ mod tests {
 
     fn text(s: &str) -> CanonicalEvent {
         CanonicalEvent::TextDelta(s.into())
+    }
+
+    #[tokio::test]
+    async fn retry_downloads_images_with_the_replacement_response_route() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(move || {
+            let calls = counted.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ([("content-type", "image/png")], "replacement-route")
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let unavailable = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap())
+            .build()
+            .unwrap();
+        let replacement = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(format!("http://{address}")).unwrap())
+            .build()
+            .unwrap();
+        let first = super::super::client::AccountResponse {
+            response: response(&[]),
+            fetch_clients: vec![unavailable],
+            lease: None,
+        };
+        let next = super::super::client::AccountResponse {
+            response: response(&[
+                json!({"image":"http://example.invalid/image.png"}),
+                finish(),
+            ]),
+            fetch_clients: vec![replacement],
+            lease: None,
+        };
+        let events = canonical_account_events_with_retry(
+            first,
+            log(),
+            std::time::Duration::from_secs(2),
+            move || Box::pin(async move { Ok(next) }),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("replacement-route");
+        assert!(events.iter().any(
+            |event| matches!(event,CanonicalEvent::TextDelta(text) if text.contains(&encoded))
+        ));
+        server.abort();
     }
 
     #[tokio::test]

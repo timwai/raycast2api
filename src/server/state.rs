@@ -29,6 +29,7 @@ pub type SharedState = Arc<AppState>;
 
 pub struct AppState {
     pub settings: Arc<Settings>,
+    pub proxy_manager: Arc<crate::proxy_manager::ProxyManager>,
     /// Redis 句柄(会话撤销使用);compact 缓存持有它的另一份克隆。
     pub redis: Option<RedisKv>,
     /// 账号调度 + 上游传输(`dispatcher.client` 是纯传输层)。
@@ -76,15 +77,18 @@ impl AppState {
     pub fn new(deps: AppDeps) -> Result<Self, String> {
         let AppDeps {
             settings,
-            client,
+            mut client,
             accounts,
             log,
             statistics,
             db,
         } = deps;
+        let proxy_manager = crate::proxy_manager::ProxyManager::new(settings.clone(), db.clone())?;
+        client.proxy_manager = Some(proxy_manager.clone());
         let aliases = ModelAliasStore::new(db.clone());
         let api_keys = Arc::new(crate::key::ApiKeyStore::new(db.clone(), &settings.api_key)?);
         Ok(Self {
+            proxy_manager,
             statistics,
             settings,
             redis: None,
@@ -103,6 +107,10 @@ impl AppState {
             models_failed_at: Mutex::new(None),
             models_redis_stale: AtomicBool::new(false),
         })
+    }
+
+    pub fn transport_client(&self) -> RaycastClient {
+        self.dispatcher.client.clone()
     }
 
     pub fn with_redis(mut self, redis: Option<RedisKv>) -> Self {
@@ -249,6 +257,7 @@ pub(crate) fn compact_test_state() -> SharedState {
     let statistics = Arc::new(crate::statistics::store::StatisticsStore::new(db.clone()));
     let log = Arc::new(RequestLogStore::new(db.clone()));
     let settings = Arc::new(Settings {
+        proxy_manager: Default::default(),
         raycast_signature_secret: "secret".into(),
         api_key: "test-key".into(),
         dashboard_password: None,

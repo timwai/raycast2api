@@ -29,6 +29,7 @@ pub mod log;
 pub mod model;
 pub mod protocol;
 pub mod proxies;
+pub mod proxy_manager;
 pub mod raycast;
 pub mod server;
 pub mod signature;

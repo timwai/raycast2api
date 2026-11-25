@@ -14,6 +14,9 @@ services:
         # build: .
         container_name: raycast2api
         restart: unless-stopped
+        init: true
+        # Allow in-flight OAuth rotation to persist before the container is killed.
+        stop_grace_period: 90s
         # 以宿主机用户身份运行，绑定挂载的 ./store 等目录才可写（镜像内默认的
         # app 用户 uid 与宿主机不一致时，SQLite 会报 unable to open database file）。
         # 1000:1000 是常见 Linux 桌面/服务器用户；按 `id -u` / `id -g` 调整。
@@ -28,6 +31,8 @@ services:
             - ./store:/app/store
 
         environment:
+            # Required only when proxy_manager.enabled is true; Base64 of exactly 32 random bytes.
+            - PROXY_ENCRYPTION_KEY=${PROXY_ENCRYPTION_KEY:-}
             - REDIS_HOST=host.docker.internal
             - REDIS_PORT=6379
             - REDIS_USERNAME=${REDIS_USERNAME:-}

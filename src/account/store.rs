@@ -321,18 +321,22 @@ fn migrate(conn: &mut diesel::sqlite::SqliteConnection) -> Result<(), diesel::re
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct AccountStore {
-    renewal_locks: std::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    renewal_locks: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+        >,
     >,
     /// 按凭据摘要记录轮换退避,避免网络结果不明时反复重放 OAuth。
-    renewal_attempts: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
+    renewal_attempts:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>>,
     db: Db,
     /// 轮询游标:最后选中的行 id。取 id 更大的下一个可用行(没有则回卷),
     /// 这样摘除某账号后轮询会自然落到它的后继,而不是跳回头部。
-    last_id: AtomicI64,
+    last_id: std::sync::Arc<AtomicI64>,
     /// 上一次选号所在的优先级档;档位变化时游标从档首重新开始。
-    last_tier: AtomicI64,
+    last_tier: std::sync::Arc<AtomicI64>,
 }
 
 impl AccountStore {
@@ -343,13 +347,13 @@ impl AccountStore {
                 let mut conn = db.lock();
                 conn.batch_execute(SCHEMA)
                     .map_err(|e| GatewayError::Internal(format!("create accounts schema: {e}")))?;
-                conn.immediate_transaction(|conn| migrate(conn))
+                conn.immediate_transaction(migrate)
                     .map_err(|e| GatewayError::Internal(format!("migrate accounts schema: {e}")))?;
             }
             Ok(Self {
                 db,
-                last_id: AtomicI64::new(0),
-                last_tier: AtomicI64::new(i64::MIN),
+                last_id: std::sync::Arc::new(AtomicI64::new(0)),
+                last_tier: std::sync::Arc::new(AtomicI64::new(i64::MIN)),
                 renewal_locks: Default::default(),
                 renewal_attempts: Default::default(),
             })

@@ -66,6 +66,8 @@ pub const MAX_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 /// JSON configuration file structure.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ConfigFile {
+    #[serde(default)]
+    pub proxy_manager: crate::proxy_manager::config::ProxyManagerConfig,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub api_key: Option<String>,
@@ -87,6 +89,7 @@ pub struct ConfigFile {
 /// Runtime configuration, loaded once at startup via [`Settings::from_path`].
 #[derive(Clone, Debug)]
 pub struct Settings {
+    pub proxy_manager: crate::proxy_manager::config::ProxyManagerConfig,
     /// Signing secret for `X-Raycast-Signature-v2` (required, no built-in default).
     pub raycast_signature_secret: String,
     /// Required global gateway API key.
@@ -181,7 +184,9 @@ impl Settings {
             return Err("dashboard_session_secret must contain at least 32 bytes when dashboard_password is set".into());
         }
 
+        config.proxy_manager.validate()?;
         Ok(Self {
+            proxy_manager: config.proxy_manager,
             raycast_signature_secret,
             api_key,
             dashboard_password,

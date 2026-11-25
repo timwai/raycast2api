@@ -15,7 +15,7 @@ use crate::log::context as debug;
 use crate::log::store::RequestLogStore;
 use crate::raycast::client::RaycastClient;
 use crate::raycast::peek::{peek_first_payload, restore_payload};
-use crate::raycast::stream::canonical_events_with_retry;
+use crate::raycast::stream::canonical_account_events_with_retry as canonical_events_with_retry;
 use crate::raycast::wire::{
     RaycastAttachment, RaycastChatRequest, RaycastRawModel, RaycastSseError,
 };
@@ -147,7 +147,7 @@ impl AccountDispatcher {
         request: &RaycastChatRequest,
         call: &CallContext,
         mut reserved: Option<Attempt>,
-    ) -> Result<reqwest::Response, GatewayError> {
+    ) -> Result<crate::raycast::client::AccountResponse, GatewayError> {
         let attempts = self.accounts.count_available().max(1);
         let mut last_error: Option<GatewayError> = None;
 
@@ -184,15 +184,19 @@ impl AccountDispatcher {
             // 图片附件上传:必须在账号选定之后(附件 ACL 绑定账号),且 body
             // 序列化之前(fileId 要进 wire)。上传失败按官方客户端行为降级:
             // 剥附件、文本加占位,请求照发,不让一张图废掉整个推理。
+            let client = self.client.for_account(&account.email, false)?;
             let mut request = request.clone();
-            if !request.pending_uploads.is_empty() {
-                if let Err(error) = self
-                    .upload_attachments(&mut request, &account, &device_id)
+            if !request.pending_uploads.is_empty()
+                && let Err(error) = self
+                    .upload_attachments(&client, &mut request, &account, &device_id)
                     .await
+            {
+                if matches!(&error, GatewayError::Admission { code, .. } if code.starts_with("proxy_"))
                 {
-                    last_error = Some(error);
-                    continue;
+                    return Err(error);
                 }
+                last_error = Some(error);
+                continue;
             }
             // 上传等异步操作期间账号可能进入冷却或被停用,聊天前再次检查。
             if let Err(error) = self.accounts.get_for_upstream(&account.email) {
@@ -200,8 +204,7 @@ impl AccountDispatcher {
                 continue;
             }
             let body = serde_json::to_string(&request)?;
-            let mut result = self
-                .client
+            let mut result = client
                 .chat(
                     &account.email,
                     &account.access_token,
@@ -215,7 +218,7 @@ impl AccountDispatcher {
                 result = match self.renew(&mut account).await {
                     Ok(()) => match self.accounts.get_for_upstream(&account.email) {
                         Ok(_) => {
-                            self.client
+                            client
                                 .chat(
                                     &account.email,
                                     &account.access_token,
@@ -237,7 +240,9 @@ impl AccountDispatcher {
                     let (peeked, response) =
                         peek_first_payload(response, self.client.settings.upstream_timeout()).await;
                     let Some(err) = peeked else {
-                        return Ok(response);
+                        return Ok(crate::raycast::client::AccountResponse::new(
+                            response, &client,
+                        ));
                     };
                     if let Some(log) = &self.client.log {
                         log.update_response(&call.request.request_id, &err.raw);
@@ -287,7 +292,10 @@ impl AccountDispatcher {
                                 "→ upstream in-stream error (not rate-limit): {message}"
                             );
                             // 其他流内错误:还原 payload,交由解析层上报。
-                            return Ok(restore_payload(response, &err.raw));
+                            return Ok(crate::raycast::client::AccountResponse::new(
+                                restore_payload(response, &err.raw),
+                                &client,
+                            ));
                         }
                     }
                 }
@@ -344,6 +352,7 @@ impl AccountDispatcher {
     /// (text-only) when everything fails.
     async fn upload_attachments(
         &self,
+        client: &RaycastClient,
         request: &mut RaycastChatRequest,
         account: &AccountRow,
         device_id: &str,
@@ -351,8 +360,7 @@ impl AccountDispatcher {
         let pending = std::mem::take(&mut request.pending_uploads);
         for upload in pending {
             self.accounts.get_for_upstream(&account.email)?;
-            let result = self
-                .client
+            let result = client
                 .upload_file(
                     &account.access_token,
                     device_id,
@@ -380,6 +388,10 @@ impl AccountDispatcher {
                     }
                 }
                 Err(error) => {
+                    if matches!(&error, GatewayError::Admission { code, .. } if code.starts_with("proxy_"))
+                    {
+                        return Err(error);
+                    }
                     tracing::warn!(
                         account = %account.email,
                         media_type = %upload.media_type,
@@ -429,11 +441,12 @@ impl AccountDispatcher {
                 Ok(account) => account,
                 Err(error) => return Err(last_error.unwrap_or(error)),
             };
-            let mut result = self.client.fetch_models(&account.access_token).await;
+            let client = self.client.for_account(&account.email, false)?;
+            let mut result = client.fetch_models(&account.access_token).await;
             if matches!(result, Err(GatewayError::TokenInvalid { .. })) {
                 result = match self.renew(&mut account).await {
                     Ok(()) => match self.accounts.get_for_upstream(&account.email) {
-                        Ok(_) => self.client.fetch_models(&account.access_token).await,
+                        Ok(_) => client.fetch_models(&account.access_token).await,
                         Err(error) => Err(error),
                     },
                     Err(error) => Err(error),
@@ -466,16 +479,15 @@ impl AccountDispatcher {
     /// 代理通道列表一并传入,供生成图片的内联下载复用同一代理策略。
     pub(crate) fn events(
         &self,
-        response: reqwest::Response,
+        response: crate::raycast::client::AccountResponse,
         request: RaycastChatRequest,
         log: Arc<RequestLogStore>,
         call: CallContext,
     ) -> impl Stream<Item = CanonicalEvent> + Send + 'static {
         let id = debug::current_request_id();
         let timeout = self.client.settings.upstream_timeout();
-        let fetch_channels = self.client.fetch_channels();
         let dispatcher = self.clone();
-        canonical_events_with_retry(response, log, timeout, fetch_channels, move || {
+        canonical_events_with_retry(response, log, timeout, move || {
             Box::pin(async move {
                 debug::REQUEST_ID
                     .scope(id, dispatcher.send_chat(&request, &call, None))

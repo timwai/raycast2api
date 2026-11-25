@@ -1,10 +1,12 @@
 import { LitElement, html } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js';
 import './views/accounts.js';
+import './views/proxy.js';
 import './views/api-keys.js';
 import './views/logs.js';
 import './views/models.js';
 import './views/statistics.js';
 import { message } from './components/message.js';
+import { ProxyRequests } from './proxy-request.js';
 
 class AccountConsole extends LitElement {
     static properties = {
@@ -29,6 +31,7 @@ class AccountConsole extends LitElement {
             if (event.persisted) this.restoreSession();
         };
         this.handlePageHide = () => this.lockConsole('', true);
+        this.proxyRequests = new ProxyRequests();
     }
     createRenderRoot() {
         return this;
@@ -58,6 +61,7 @@ class AccountConsole extends LitElement {
         this.dashboardPassword = '';
         this.loginAttempt = null;
         this.sessionEpoch = {};
+        this.proxyRequests.clear();
         this.querySelector('api-keys-panel')?.clear();
         this.loggingIn = false;
         this.querySelector('logs-panel')?.closeDetail();
@@ -149,27 +153,35 @@ class AccountConsole extends LitElement {
     async request(path, body, resource = 'accounts') {
         if (!this.authenticated) throw new Error('请先输入控制台密码登录。');
         const session = this.sessionEpoch;
-        const response = await fetch('/v1/' + resource + '/' + path, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Dashboard-Request': '1' },
-            credentials: 'same-origin',
-            cache: 'no-store',
-            body: JSON.stringify(body)
+        return this.proxyRequests.run(resource, path, body, async idempotency => {
+            const response = await fetch('/v1/' + resource + '/' + path, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Dashboard-Request': '1', ...idempotency },
+                credentials: 'same-origin',
+                cache: 'no-store',
+                body: JSON.stringify(body)
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!this.authenticated || this.sessionEpoch !== session) throw new Error('会话已结束。');
+            if (response.status === 401) {
+                this.lockConsole('登录已失效，请重新输入控制台密码。');
+                throw new Error('登录已失效，请重新输入控制台密码。');
+            }
+            if (!response.ok || result.code >= 400) {
+                const error = new Error(result.message || '请求失败 (' + response.status + ')');
+                error.retryable = response.status >= 500;
+                throw error;
+            }
+            if (!Object.hasOwn(result, 'data')) throw new Error('响应不完整，请重试。');
+            return result.data;
         });
-        const result = await response.json().catch(() => ({}));
-        if (!this.authenticated || this.sessionEpoch !== session) throw new Error('会话已结束。');
-        if (response.status === 401) {
-            this.lockConsole('登录已失效，请重新输入控制台密码。');
-            throw new Error('登录已失效，请重新输入控制台密码。');
-        }
-        if (!response.ok || result.code >= 400) throw new Error(result.message || '请求失败 (' + response.status + ')');
-        return result.data;
     }
     async switchPanel(panel) {
         this.querySelectorAll('ui-date-picker').forEach(picker => picker.picker?.close());
         this.panel = panel;
         await this.updateComplete;
         if (!this.authenticated || this.panel !== panel) return;
+        if (panel === 'proxy') this.querySelector('proxy-panel')?.load();
         if (panel === 'api-keys') this.querySelector('api-keys-panel')?.load();
         if (panel === 'logs') this.querySelector('logs-panel').load();
         if (panel === 'models') this.querySelector('models-panel').load();
@@ -234,6 +246,7 @@ class AccountConsole extends LitElement {
                         ${[
                             ['accounts', '账号面板'],
                             ['models', '模型面板'],
+                            ['proxy', '代理管理'],
                             ['api-keys', 'API Key'],
                             ['statistics', '统计面板'],
                             ['logs', '日志面板']
@@ -258,7 +271,10 @@ class AccountConsole extends LitElement {
                 ?inert=${this.panel !== 'accounts'}
                 .active=${this.panel === 'accounts'}
                 .request=${(path, body) => this.request(path, body)}
+                @manage-account-proxy=${event => this.querySelector('proxy-binding-dialog')?.open(event.detail.email)}
             ></accounts-panel>
+            <proxy-binding-dialog .request=${(path, body, resource = 'proxy') => this.request(path, body, resource)} @binding-updated=${() => this.querySelector('accounts-panel')?.load()}></proxy-binding-dialog>
+            <proxy-panel class="min-h-0 flex-1 overflow-hidden ${this.panel === 'proxy' ? 'block' : 'hidden'}" ?inert=${this.panel !== 'proxy'} .request=${(path, body) => this.request(path, body, 'proxy')}></proxy-panel>
             <logs-panel
                 class="min-h-0 flex-1 overflow-hidden ${this.panel === 'logs' ? 'block' : 'hidden'}"
                 ?inert=${this.panel !== 'logs'}

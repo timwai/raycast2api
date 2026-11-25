@@ -42,6 +42,7 @@ pub enum TokenRenewalOutcome {
     InvalidGrant,
     /// 其他失败(网络/5xx/响应异常),可重试。
     Failed(String),
+    ProxyFailed(crate::error::GatewayError),
 }
 
 #[derive(Deserialize)]
@@ -92,15 +93,32 @@ pub async fn renew_expiring(store: &AccountStore, client: &crate::raycast::clien
         }
     };
     for account in accounts {
-        if expiring(&account, unix_secs() as i64) {
-            if let Err(error) = renew(store, client, &account, RenewalReason::Expiring).await {
-                tracing::warn!(email = %account.email, %error, "necessary token renewal failed");
-            }
+        if expiring(&account, unix_secs() as i64)
+            && let Err(error) = renew(store, client, &account, RenewalReason::Expiring).await
+        {
+            tracing::warn!(email = %account.email, %error, "necessary token renewal failed");
         }
     }
 }
 
+// Once OAuth is sent, caller cancellation must not discard rotated credentials.
 async fn renew(
+    store: &AccountStore,
+    client: &crate::raycast::client::RaycastClient,
+    account: &AccountRow,
+    reason: RenewalReason,
+) -> Result<String, crate::error::GatewayError> {
+    let store = store.clone();
+    let client = client.clone();
+    let account = account.clone();
+    tokio::spawn(async move { renew_inner(&store, &client, &account, reason).await })
+        .await
+        .map_err(|_| {
+            crate::error::GatewayError::Internal("necessary token renewal task failed".into())
+        })?
+}
+
+async fn renew_inner(
     store: &AccountStore,
     client: &crate::raycast::client::RaycastClient,
     account: &AccountRow,
@@ -132,6 +150,7 @@ async fn renew(
     digest.update([0]);
     digest.update(refresh.as_bytes());
     let credentials = hex::encode(digest.finalize());
+    let client = client.for_account(&current.email, true)?;
     if !store.claim_renewal(&current.email, &credentials, unix_secs() as i64) {
         if matches!(reason, RenewalReason::Expiring) {
             return Ok(current.access_token);
@@ -141,7 +160,7 @@ async fn renew(
             message: "token renewal deferred after an earlier failure; replace rejected credentials before retrying".into(),
         });
     }
-    let outcome = renew_token_call(client, refresh).await;
+    let outcome = renew_token_call(&client, refresh).await;
     if matches!(&outcome, TokenRenewalOutcome::InvalidGrant) {
         store.reject_renewal(&current.email, &credentials);
     }
@@ -170,6 +189,7 @@ fn persist_outcome(
         TokenRenewalOutcome::InvalidGrant => Err(GatewayError::TokenInvalid {
             message: "refresh_token invalid_grant".into(),
         }),
+        TokenRenewalOutcome::ProxyFailed(error) => Err(error),
         TokenRenewalOutcome::Failed(reason) => Err(GatewayError::Upstream {
             status: 502,
             message: reason,
@@ -190,6 +210,9 @@ async fn renew_token_call(
     });
     let response = match client.oauth_token(&body).await {
         Ok(r) => r,
+        Err(e @ crate::error::GatewayError::Admission { .. }) => {
+            return TokenRenewalOutcome::ProxyFailed(e);
+        }
         Err(e) => return TokenRenewalOutcome::Failed(format!("network: {e}")),
     };
 
@@ -442,6 +465,52 @@ mod tests {
         let (a, b) = tokio::join!(a, b);
         assert_eq!(a.unwrap(), "rca_new");
         assert_eq!(b.unwrap(), "rca_new");
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_does_not_discard_rotated_tokens() {
+        let state = crate::server::state::compact_test_state();
+        let received = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let notified = received.clone();
+        let ready = release.clone();
+        let app = axum::Router::new().fallback(move || { let received = notified.clone(); let release = ready.clone(); async move {
+            received.notify_one(); release.notified().await;
+            axum::Json(serde_json::json!({"access_token":"rca_rotated","refresh_token":"new_refresh","expires_in":3600}))
+        }});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = state.dispatcher.client.clone();
+        client.oauth_url = Some(format!(
+            "http://{}/oauth/token",
+            listener.local_addr().unwrap()
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        state.accounts.upsert(&serde_json::from_value(serde_json::json!({"user":{"email":"cancel@test"},"device_id":"1111111111111111111111111111111111111111111111111111111111111111","access_token":"rca_old","refresh_token":"old"})).unwrap()).unwrap();
+        let account = state.accounts.get("cancel@test").unwrap().unwrap();
+        let store = state.accounts.clone();
+        let caller = tokio::spawn(async move { auto_renew(&store, &client, &account).await });
+        received.notified().await;
+        caller.abort();
+        release.notify_one();
+        for _ in 0..100 {
+            if state
+                .accounts
+                .get("cancel@test")
+                .unwrap()
+                .unwrap()
+                .access_token
+                == "rca_rotated"
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let saved = state.accounts.get("cancel@test").unwrap().unwrap();
+        assert_eq!(saved.access_token, "rca_rotated");
+        assert_eq!(saved.refresh_token.as_deref(), Some("new_refresh"));
+        server.abort();
     }
 
     #[test]

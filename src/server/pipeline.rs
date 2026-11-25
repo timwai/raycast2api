@@ -262,7 +262,9 @@ pub(crate) async fn events(
     {
         Ok(response) => response,
         Err(error) => {
-            if !matches!(error, GatewayError::UsageTrackingUnavailable) {
+            if !matches!(error, GatewayError::UsageTrackingUnavailable)
+                && !matches!(&error, GatewayError::Admission { code, .. } if code.starts_with("proxy_"))
+            {
                 state.health.mark_failed();
             }
             return Err(error);
