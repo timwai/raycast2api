@@ -448,6 +448,7 @@ AccountProxyRouter 返回三种明确结果：
 | POST | /v1/proxy/nodes/detail | 脱敏元数据，不返回原 YAML |
 | POST | /v1/proxy/nodes/test | 显式单节点测试，202 返回操作对象 |
 | POST | /v1/proxy/nodes/test-batch | 每批 1–20 项，去重并合并单节点任务，202 返回批次 |
+| POST | /v1/proxy/nodes/test-all | 全部启用订阅当前节点；按配置并发分批排队，202 返回批次 |
 | POST | /v1/proxy/bindings/list | 绑定版本、状态、原因 |
 | POST | /v1/proxy/bindings/set | 新建/换绑操作 |
 | POST | /v1/proxy/bindings/delete | 显式解绑操作 |
@@ -465,6 +466,10 @@ AccountProxyRouter 返回三种明确结果：
 现有账号列表/详情增加 proxy_binding，含节点、订阅名称、端口、revision、generation、运行状态和原因。null 只表示没有持久化绑定，不能表示核心失效。
 
 ### 10.3 手动测速
+
+一键全量测试不受列表筛选、分页和勾选 20 项上限影响；跳过缺失节点和停用订阅，同节点任务仍合并。全量操作只保留与手动测速并发数相同的在途子任务窗口。结果包含 completed/total/succeeded 和逐项结果。
+
+新建/更换绑定只允许 delay_checked_at 存在、delay_ms > 0 且无 delay_error_code 的节点。配置指纹变化后旧测试结果失效，必须重新测试。已有绑定测试失败不自动解绑或更换，账号卡片显示红色失败提示和最近测试时间；重测通过后清除。
 
 只在显式操作时测试，不带账号 token。服务端固定测试目标与超时，默认 https://www.gstatic.com/generate_204、5000 ms，并发 3，每次最多 20 节点；同节点重复任务合并。单节点与批量均先持久化再返回 202，完成后可发起新一轮测试。
 

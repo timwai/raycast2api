@@ -2,8 +2,8 @@ import { LitElement, html } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/li
 import { message } from '../components.js';
 import { formatDate } from '../utils.js';
 
-export async function waitProxyOperation(request, operation, progress = () => {}) {
-    const deadline = Date.now() + 600000;
+export async function waitProxyOperation(request, operation, progress = () => {}, timeout = 600000) {
+    const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
         progress(operation.phase, operation);
         if (operation.phase === 'committed') return operation;
@@ -13,6 +13,20 @@ export async function waitProxyOperation(request, operation, progress = () => {}
         operation = await request('operations/detail', { id: operation.id });
     }
     throw new Error('操作仍在排队或恢复中，请刷新状态查看结果。');
+}
+export function nodeTestStatus(node) {
+    if (node.test_status) return node.test_status;
+    if (node.delay_checked_at != null && node.delay_ms > 0 && !node.delay_error_code) return 'passed';
+    return node.delay_checked_at != null || node.delay_error_code ? 'failed' : 'untested';
+}
+function selectable(node) {
+    return node.presence === 'present' && node.subscription_enabled && nodeTestStatus(node) === 'passed';
+}
+function nodeChoiceStatus(node) {
+    if (!node.subscription_enabled) return '订阅停用';
+    if (nodeTestStatus(node) === 'failed') return '测试失败，不可选';
+    if (nodeTestStatus(node) === 'untested') return '未测试，请先测试';
+    return node.delay_ms + ' ms';
 }
 
 export function parseBatchSubscriptions(text, interval) {
@@ -57,6 +71,10 @@ class ProxyBindingDialog extends LitElement {
         event.preventDefault(); if (this.busy) return;
         const binding = this.account.proxy_binding;
         if (this.selected === (binding?.node_id || '')) return this.close();
+        if (this.selected && !this.nodes.some(node => node.id === this.selected && selectable(node))) {
+            this.error = '该节点尚未通过测试，请先到代理管理测试通过后再选用。';
+            return;
+        }
         this.busy = true; this.error = '';
         try {
             const path = this.selected ? 'bindings/set' : 'bindings/delete';
@@ -86,10 +104,11 @@ class ProxyBindingDialog extends LitElement {
                 <label class="block text-sm">出口节点
                     <select class="mt-2 w-full rounded border border-line p-2" .value=${this.selected} @change=${e => this.selected = e.target.value} ?disabled=${this.busy}>
                         <option value="">不绑定，使用现有全局策略</option>
-                        ${current && !this.nodes.some(n => n.id === current.node_id) ? html`<option value=${current.node_id}>当前：${current.node_name || current.node_id}（${current.status}）</option>` : ''}
-                        ${[...groups].map(([label, nodes]) => html`<optgroup label=${label}>${nodes.map(n => html`<option value=${n.id} ?disabled=${!n.subscription_enabled}>${n.original_name} · ${n.protocol}${n.subscription_enabled ? '' : '（订阅停用）'}</option>`)}</optgroup>`)}
+                        ${current && !this.nodes.some(n => n.id === current.node_id) ? html`<option value=${current.node_id} disabled>当前：${current.node_name || current.node_id}（${current.test_status === 'failed' ? '测试失败' : current.status}）</option>` : ''}
+                        ${[...groups].map(([label, nodes]) => html`<optgroup label=${label}>${nodes.map(n => html`<option value=${n.id} ?disabled=${!selectable(n)}>${n.original_name} · ${n.protocol}（${nodeChoiceStatus(n)}）</option>`)}</optgroup>`)}
                     </select>
                 </label>
+                <p class="mt-3 text-xs text-muted">仅最近一次测试通过的节点可选。未测试或测试失败时，请先到代理管理重测。</p>
                 <p class="mt-3 text-xs text-muted">配置应用可能中断在途请求。绑定节点不可用时拒绝请求；只有显式解绑才恢复全局策略。</p>
                 ${this.error ? html`<p role="alert" class="mt-3 text-sm text-red-700">${this.error}</p>` : ''}
                 <div class="mt-5 flex justify-end gap-3">
@@ -138,15 +157,17 @@ class ProxyPanel extends LitElement {
         try {
             const operation = await this.request(path, body);
             const done = await waitProxyOperation(this.request, operation, (phase, current) => {
+                if (this.isConnected === false) throw new Error('页面已关闭，测试仍在后台运行。');
                 const r = current.result;
                 this.progress = r?.total != null ? `已完成 ${r.completed ?? r.items?.length ?? 0} / ${r.total}` : `任务状态：${phase}`;
-            });
+            }, path === 'nodes/test-all' ? Infinity : 600000);
             if (done.result?.items) {
                 this.results = done.result;
                 const r = done.result;
                 message(`完成 ${r.total} 项，成功 ${r.succeeded} 项，失败 ${r.total - r.succeeded} 项`, r.succeeded === r.total ? 'success' : 'warning');
             } else if (success) message(success, 'success');
             this.editor = null; this.url = ''; this.batchText = ''; await this.load();
+            if (path.startsWith('nodes/test')) this.dispatchEvent(new CustomEvent('proxy-tests-updated', { bubbles: true, composed: true }));
             return done;
         } catch (error) { this.error = error.message; } finally { this.busy = false; }
     }
@@ -179,12 +200,15 @@ class ProxyPanel extends LitElement {
         if (!this.selected.size) return;
         if (await this.change('nodes/test-batch', { ids: [...this.selected] })) this.selected = new Set();
     }
+    async testAll() {
+        await this.change('nodes/test-all', {}, '全部节点测试完成');
+    }
     render() {
         const button = 'rounded border border-line bg-white px-3 py-1.5 text-xs disabled:opacity-50';
         return html`<section class="h-full overflow-auto p-4" aria-label="代理管理">
             <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
                 <div><h1 class="font-semibold">代理管理</h1><p class="mt-1 text-xs text-muted">${this.runtime?.enabled ? this.runtime.ready ? '核心就绪' : '核心不可用，绑定账号已阻断' : '模块未启用'} · 配置代次 ${this.runtime?.generation ?? '—'} · ${this.runtime?.bindings || 0} 个账号绑定</p></div>
-                <div class="flex flex-wrap gap-2"><button class=${button} @click=${() => this.change('subscriptions/refresh-all', {})} ?disabled=${this.busy || !this.runtime?.enabled || !this.subscriptions.some(s => s.enabled)}>刷新全部</button><button class=${button} @click=${() => { this.edit(); this.editor = { batch: true }; }} ?disabled=${this.busy || !this.runtime?.enabled}>批量添加</button><button class=${button} @click=${() => this.edit()} ?disabled=${this.busy || !this.runtime?.enabled}>添加订阅</button><button class=${button} @click=${this.load} ?disabled=${this.loading}>刷新页面</button></div>
+                <div class="flex flex-wrap gap-2"><button class=${button} @click=${this.testAll} ?disabled=${this.busy || !this.runtime?.ready}>一键测试所有节点</button><button class=${button} @click=${() => this.change('subscriptions/refresh-all', {})} ?disabled=${this.busy || !this.runtime?.enabled || !this.subscriptions.some(s => s.enabled)}>刷新全部</button><button class=${button} @click=${() => { this.edit(); this.editor = { batch: true }; }} ?disabled=${this.busy || !this.runtime?.enabled}>批量添加</button><button class=${button} @click=${() => this.edit()} ?disabled=${this.busy || !this.runtime?.enabled}>添加订阅</button><button class=${button} @click=${this.load} ?disabled=${this.loading}>刷新页面</button></div>
             </div>
             ${this.error ? html`<p role="alert" class="mb-3 rounded bg-red-50 p-3 text-sm text-red-700">${this.error}</p>` : ''}
             ${this.busy ? html`<p role="status" class="mb-3 text-sm text-blue-700">${this.progress}；配置更新可能中断在途请求。</p>` : ''}
@@ -212,7 +236,7 @@ class ProxyPanel extends LitElement {
                 <label class="flex items-center gap-1 text-xs"><input type="checkbox" .checked=${this.sortDelay} @change=${e => this.sortDelay = e.target.checked} />按延迟排序</label><button class=${button}>搜索</button>
             </form>
             <div class="mb-3 flex flex-wrap items-center gap-2"><button class=${button} ?disabled=${this.busy || !this.selected.size || !this.runtime?.ready} @click=${this.testSelected}>批量测速（${this.selected.size}/20）</button><button class=${button} ?disabled=${this.busy || !this.selected.size} @click=${() => this.selected = new Set()}>清空选择</button><span class="text-xs text-muted">测速仅在手动操作时运行</span></div>
-            <div class="overflow-x-auto rounded-lg border border-line bg-white"><table style="min-width:760px" class="w-full text-left text-xs"><caption class="p-3 text-left font-semibold">节点 · 共 ${this.total} 项</caption><thead class="border-y border-line bg-slate-50"><tr><th class="p-3">选择</th>${['节点 / 订阅', '协议 / 服务器', '地区', '状态', '延迟', '绑定数', '操作'].map(x => html`<th class="p-3">${x}</th>`)}</tr></thead><tbody>${this.nodes.map(n => html`<tr class="border-b border-line"><td class="p-3"><input type="checkbox" aria-label=${'选择节点 ' + n.original_name} .checked=${this.selected.has(n.id)} ?disabled=${this.busy || n.presence !== 'present' || !n.subscription_enabled || (!this.selected.has(n.id) && this.selected.size >= 20)} @change=${e => this.toggleNode(n, e.target.checked)} /></td><td class="p-3">${n.original_name}<p class="mt-1 text-muted">${n.subscription_name}</p></td><td class="p-3">${n.protocol}<p class="mt-1 text-muted">${n.server}:${n.server_port}</p></td><td class="p-3">${n.country || '未知'}</td><td class="p-3">${n.presence === 'present' ? n.subscription_enabled ? '已导入' : '订阅停用' : '已缺失'}</td><td class="p-3">${n.delay_ms == null ? '未测试' : n.delay_ms + ' ms'}</td><td class="p-3">${n.binding_count}</td><td class="p-3"><button class=${button} ?disabled=${this.busy || n.presence !== 'present' || !n.subscription_enabled || !this.runtime?.ready} @click=${() => this.test(n)}>手动测速</button></td></tr>`)}</tbody></table></div>
+            <div class="overflow-x-auto rounded-lg border border-line bg-white"><table style="min-width:760px" class="w-full text-left text-xs"><caption class="p-3 text-left font-semibold">节点 · 共 ${this.total} 项</caption><thead class="border-y border-line bg-slate-50"><tr><th class="p-3">选择</th>${['节点 / 订阅', '协议 / 服务器', '地区', '状态', '延迟', '绑定数', '操作'].map(x => html`<th class="p-3">${x}</th>`)}</tr></thead><tbody>${this.nodes.map(n => html`<tr class="border-b border-line"><td class="p-3"><input type="checkbox" aria-label=${'选择节点 ' + n.original_name} .checked=${this.selected.has(n.id)} ?disabled=${this.busy || n.presence !== 'present' || !n.subscription_enabled || (!this.selected.has(n.id) && this.selected.size >= 20)} @change=${e => this.toggleNode(n, e.target.checked)} /></td><td class="p-3">${n.original_name}<p class="mt-1 text-muted">${n.subscription_name}</p></td><td class="p-3">${n.protocol}<p class="mt-1 text-muted">${n.server}:${n.server_port}</p></td><td class="p-3">${n.country || '未知'}</td><td class="p-3">${n.presence === 'present' ? n.subscription_enabled ? '已导入' : '订阅停用' : '已缺失'}</td><td class="p-3">${nodeTestStatus(n) === 'failed' ? '测试失败' : nodeTestStatus(n) === 'untested' ? '未测试' : n.delay_ms + ' ms'}</td><td class="p-3">${n.binding_count}</td><td class="p-3"><button class=${button} ?disabled=${this.busy || n.presence !== 'present' || !n.subscription_enabled || !this.runtime?.ready} @click=${() => this.test(n)}>手动测速</button></td></tr>`)}</tbody></table></div>
             <div class="mt-3 flex items-center justify-end gap-3 text-xs"><button class=${button} ?disabled=${this.page <= 1 || this.loading} @click=${() => { this.page--; this.load(); }}>上一页</button><span>${this.page} / ${this.pages || 1}</span><button class=${button} ?disabled=${this.page >= this.pages || this.loading} @click=${() => { this.page++; this.load(); }}>下一页</button></div>
         </section>`;
     }

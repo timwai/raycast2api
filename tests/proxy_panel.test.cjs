@@ -44,16 +44,17 @@ test('definitive validation errors release their idempotency key', async () => {
     await client.run('proxy', 'subscriptions/create-batch', { items: [] }, async h => assert.notEqual(h['Idempotency-Key'], first));
 });
 
-function mount() {
+function mount(tag = 'proxy-panel') {
     const elements = new Map(); const notices = [];
     const scope = {
-        LitElement: class { requestUpdate() {} }, html: (parts, ...values) => ({ parts, values }),
+        LitElement: class { requestUpdate() {} dispatchEvent(event) { this.lastEvent = event; } }, html: (parts, ...values) => ({ parts, values }),
         customElements: { define: (name, element) => elements.set(name, element) },
-        message: (...args) => notices.push(args), formatDate: () => '', setTimeout, Date
+        message: (...args) => notices.push(args), formatDate: () => '', setTimeout, Date,
+        CustomEvent: class { constructor(type, options) { this.type = type; Object.assign(this, options); } }
     };
     runInNewContext(readFileSync(join(__dirname, '../src/page/views/proxy.js'), 'utf8')
         .replace(/^import .*;\r?\n/gm, '').replace(/^export /gm, '') + '\nthis.parse = parseBatchSubscriptions;', scope);
-    const panel = new (elements.get('proxy-panel'))();
+    const panel = new (elements.get(tag))();
     panel.load = async () => {};
     return { panel, notices, parse: scope.parse };
 }
@@ -96,4 +97,55 @@ test('single node testing waits for operation completion and surfaces failed tes
     assert.equal(calls, 2);
     assert.match(panel.error, /proxy_test_failed/);
     assert.ok(!notices.some(([text]) => text.includes('延迟：')));
+});
+
+function templates(value) {
+    if (Array.isArray(value)) return Array.from(value).flatMap(templates);
+    if (!value?.parts) return [];
+    return [value, ...Array.from(value.values).flatMap(templates)];
+}
+
+test('all-node testing sends one unfiltered request and refreshes account test status', async () => {
+    const { panel } = mount();
+    panel.keyword = 'filter'; panel.subscription = 'sub'; panel.page = 5;
+    panel.request = async (path, body) => {
+        assert.equal(path, 'nodes/test-all');
+        assert.equal(Object.keys(body).length, 0);
+        return { id: 'all', phase: 'committed', result: { total: 35, succeeded: 34, items: [] } };
+    };
+    await panel.testAll();
+    assert.equal(panel.results.total, 35);
+    assert.equal(panel.lastEvent.type, 'proxy-tests-updated');
+});
+
+test('binding options disable untested and failed nodes and reject a forged selection', async () => {
+    const { panel: dialog } = mount('proxy-binding-dialog');
+    dialog.account = { email: 'account@test', proxy_binding: null };
+    dialog.nodes = [
+        { id: 'passing', original_name: 'passing', protocol: 'http', presence: 'present', subscription_enabled: true, test_status: 'passed', delay_ms: 42 },
+        { id: 'failed', original_name: 'failed', protocol: 'http', presence: 'present', subscription_enabled: true, test_status: 'failed' },
+        { id: 'untested', original_name: 'untested', protocol: 'http', presence: 'present', subscription_enabled: true, test_status: 'untested' }
+    ];
+    const options = templates(dialog.render()).filter(t => t.parts[0] === '<option value=');
+    assert.equal(options.length, 3);
+    assert.equal(options[0].values[1], false);
+    assert.equal(options[1].values[1], true);
+    assert.equal(options[2].values[1], true);
+    let calls = 0; dialog.request = async () => { calls++; };
+    dialog.selected = 'failed';
+    await dialog.save({ preventDefault() {} });
+    assert.equal(calls, 0);
+    assert.match(dialog.error, /尚未通过测试/);
+});
+
+test('a failed existing binding still allows explicit unbinding', async () => {
+    const { panel: dialog } = mount('proxy-binding-dialog');
+    dialog.account = { email: 'account@test', proxy_binding: { node_id: 'failed', revision: 7, test_status: 'failed' } };
+    dialog.selected = ''; dialog.close = () => {};
+    dialog.request = async (path, body) => {
+        assert.equal(path, 'bindings/delete'); assert.equal(body.expected_revision, 7);
+        return { id: 'unbind', phase: 'committed' };
+    };
+    await dialog.save({ preventDefault() {} });
+    assert.equal(dialog.lastEvent.type, 'binding-updated');
 });

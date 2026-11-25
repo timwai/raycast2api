@@ -1,7 +1,7 @@
 const mutations = new Set([
     'subscriptions/create', 'subscriptions/create-batch', 'subscriptions/update',
     'subscriptions/delete', 'subscriptions/refresh', 'subscriptions/refresh-all',
-    'nodes/test', 'nodes/test-batch', 'bindings/set', 'bindings/delete'
+    'nodes/test', 'nodes/test-batch', 'nodes/test-all', 'bindings/set', 'bindings/delete'
 ]);
 
 function canonical(value) {

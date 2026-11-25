@@ -32,6 +32,7 @@ pub(crate) fn routes() -> Router<SharedState> {
         .route("/proxy/nodes/detail", post(proxy::node_detail))
         .route("/proxy/nodes/test", post(proxy::test))
         .route("/proxy/nodes/test-batch", post(proxy::test_batch))
+        .route("/proxy/nodes/test-all", post(proxy::test_all))
         .route("/proxy/bindings/list", post(proxy::bindings))
         .route("/proxy/bindings/set", post(proxy::set_binding))
         .route("/proxy/bindings/delete", post(proxy::delete_binding))

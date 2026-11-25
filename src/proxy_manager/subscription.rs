@@ -82,6 +82,8 @@ pub async fn download(url: &str, settings: &Settings) -> Result<Vec<u8>, Gateway
             }
             let mut builder = reqwest::Client::builder()
                 .no_proxy()
+                // Subscription providers negotiate Clash YAML from the client identity.
+                .user_agent("clash.meta")
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(config.subscription_timeout_secs))
                 .resolve_to_addrs(&host, &addresses);

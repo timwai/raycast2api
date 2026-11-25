@@ -41,6 +41,7 @@ pub enum Action {
         items: Vec<SubscriptionInput>,
     },
     RefreshAll,
+    TestAllNodes,
     TestNode {
         id: String,
     },
@@ -87,6 +88,7 @@ impl Action {
             Self::Refresh { id } => Some(format!("refresh:{id}")),
             Self::TestNode { id } => Some(format!("test:{id}")),
             Self::RefreshAll => Some("refresh-all".into()),
+            Self::TestAllNodes => Some("test-all".into()),
             Self::TestNodes { ids } => {
                 use sha2::Digest;
                 let mut ids = ids.clone();
@@ -106,7 +108,7 @@ impl Action {
         match self {
             Self::Refresh { .. } => JobClass::Download,
             Self::TestNode { .. } => JobClass::Test,
-            Self::RefreshAll | Self::TestNodes { .. } => JobClass::Batch,
+            Self::RefreshAll | Self::TestNodes { .. } | Self::TestAllNodes => JobClass::Batch,
             _ => JobClass::Control,
         }
     }
@@ -292,7 +294,8 @@ impl ProxyManager {
         };
         Ok(Some(
             json!({"node_id":b.node_id,"node_name":n.map(|n|&n.original_name),"subscription_name":sub.map(|s|&s.name),"listener_port":b.listener_port,"revision":b.revision,"generation":s.generation,
-            "status":if self.router.applying.load(Ordering::SeqCst){"applying"}else if reason.is_some(){"blocked"}else{"active"},"reason":reason}),
+            "status":if self.router.applying.load(Ordering::SeqCst){"applying"}else if reason.is_some(){"blocked"}else{"active"},"reason":reason,
+            "test_status":n.map(|n|n.test_status()),"delay_ms":n.and_then(|n|n.delay_ms),"delay_checked_at":n.and_then(|n|n.delay_checked_at),"delay_error_code":n.and_then(|n|n.delay_error_code.as_deref())}),
         ))
     }
     pub fn bindings(&self) -> Result<Vec<Value>, GatewayError> {
@@ -608,7 +611,10 @@ impl ProxyManager {
         op.updated_at = now();
         self.store.save_operation(op)?;
         let action = self.decode_action(op)?;
-        if matches!(action, Action::RefreshAll | Action::TestNodes { .. }) {
+        if matches!(
+            action,
+            Action::RefreshAll | Action::TestNodes { .. } | Action::TestAllNodes
+        ) {
             return self.execute_batch(op, &action).await;
         }
         if let Action::TestNode { id } = &action {
@@ -723,7 +729,10 @@ impl ProxyManager {
                     json!({"items":results,"succeeded":results.iter().filter(|r|r["success"]==true).count(),"total":results.len()}),
                 );
             }
-            Action::RefreshAll | Action::TestNodes { .. } | Action::TestNode { .. } => {
+            Action::RefreshAll
+            | Action::TestNodes { .. }
+            | Action::TestNode { .. }
+            | Action::TestAllNodes => {
                 unreachable!("handled before configuration application")
             }
             Action::CreateSubscription {
@@ -876,6 +885,17 @@ impl ProxyManager {
                     return Err(GatewayError::Conflict(
                         "proxy node is missing or subscription is disabled".into(),
                     ));
+                }
+                if !node.test_passed() {
+                    return Err(GatewayError::Admission {
+                        status: axum::http::StatusCode::CONFLICT,
+                        code: if node.test_status() == "failed" {
+                            "proxy_test_failed"
+                        } else {
+                            "proxy_node_untested"
+                        },
+                        message: "该节点尚未通过测试，请先测试通过后再选为代理出口。".into(),
+                    });
                 }
                 let port = if let Some(b) = previous {
                     b.listener_port
@@ -1260,6 +1280,21 @@ impl ProxyManager {
                         .cloned()
                         .collect()
                 }
+                Action::TestAllNodes => {
+                    let snapshot = self.router.snapshot();
+                    snapshot
+                        .nodes
+                        .values()
+                        .filter(|node| {
+                            node.presence == "present"
+                                && snapshot
+                                    .subscriptions
+                                    .get(&node.subscription_id)
+                                    .is_some_and(|sub| sub.enabled)
+                        })
+                        .map(|node| node.id.clone())
+                        .collect()
+                }
                 _ => unreachable!(),
             };
             targets
@@ -1270,30 +1305,12 @@ impl ProxyManager {
         };
         op.result = Some(json!({"items":items}));
         self.store.save_operation(op)?;
-        for item in &mut items {
-            if item.get("operation_id").is_some() || item.get("success").is_some() {
-                continue;
-            }
-            let target = item["target_id"].as_str().unwrap_or_default().to_string();
-            let child = match action {
-                Action::RefreshAll => Action::Refresh { id: target.clone() },
-                Action::TestNodes { .. } => Action::TestNode { id: target.clone() },
-                _ => unreachable!(),
-            };
-            match self
-                .enqueue(child, Some(format!("batch:{}:{target}", op.id)))
-                .await
-            {
-                Ok(child) => item["operation_id"] = json!(child.id),
-                Err(e) => {
-                    item["success"] = json!(false);
-                    item["code"] = json!("proxy_enqueue_failed");
-                    item["message"] = json!(e.to_string());
-                }
-            }
-        }
-        op.result = Some(json!({"items":items}));
-        self.store.save_operation(op)?;
+        // An all-node test may contain thousands of nodes. Keep its child queue bounded.
+        let window = if matches!(action, Action::TestAllNodes) {
+            self.config().manual_test_concurrency
+        } else {
+            usize::MAX
+        };
         loop {
             if self.stopping.load(Ordering::SeqCst) {
                 return Err(error(
@@ -1302,11 +1319,18 @@ impl ProxyManager {
                 ));
             }
             let mut completed = 0;
+            let mut inflight = 0;
+            let mut changed = false;
             for item in &mut items {
+                if item.get("success").is_some() {
+                    completed += 1;
+                    continue;
+                }
                 if let Some(child_id) = item.get("operation_id").and_then(Value::as_str) {
                     let child = self.store.operation(child_id)?;
                     if terminal(&child.phase) {
                         completed += 1;
+                        changed = true;
                         item["phase"] = json!(child.phase);
                         item["success"] = json!(
                             child.phase == "committed"
@@ -1321,22 +1345,57 @@ impl ProxyManager {
                         if let Some(message) = child.message {
                             item["message"] = json!(message);
                         }
+                    } else {
+                        inflight += 1;
                     }
-                } else if item.get("success").is_some() {
-                    completed += 1;
                 }
             }
-            op.result = Some(
-                json!({"items":items,"completed":completed,"total":items.len(),"succeeded":items.iter().filter(|i|i["success"]==true).count()}),
-            );
-            op.updated_at = now();
-            if completed == items.len() {
-                op.phase = "committed".into();
-                op.action_ciphertext = None;
+            for item in &mut items {
+                if inflight >= window {
+                    break;
+                }
+                if item.get("operation_id").is_some() || item.get("success").is_some() {
+                    continue;
+                }
+                let target = item["target_id"].as_str().unwrap_or_default().to_string();
+                let child = match action {
+                    Action::RefreshAll => Action::Refresh { id: target.clone() },
+                    Action::TestNodes { .. } | Action::TestAllNodes => {
+                        Action::TestNode { id: target.clone() }
+                    }
+                    _ => unreachable!(),
+                };
+                match self
+                    .enqueue(child, Some(format!("batch:{}:{target}", op.id)))
+                    .await
+                {
+                    Ok(child) => {
+                        item["operation_id"] = json!(child.id);
+                        inflight += 1;
+                    }
+                    Err(e) => {
+                        completed += 1;
+                        item["success"] = json!(false);
+                        item["code"] = json!("proxy_enqueue_failed");
+                        item["message"] = json!(e.to_string());
+                    }
+                }
+                changed = true;
+            }
+            if changed || completed == items.len() {
+                op.result = Some(
+                    json!({"items":items,"completed":completed,"total":items.len(),"succeeded":items.iter().filter(|i|i["success"]==true).count()}),
+                );
+                op.updated_at = now();
+                if completed == items.len() {
+                    op.phase = "committed".into();
+                    op.action_ciphertext = None;
+                }
                 self.store.save_operation(op)?;
+            }
+            if completed == items.len() {
                 return Ok(());
             }
-            self.store.save_operation(op)?;
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
@@ -1466,6 +1525,140 @@ mod tests {
         stored.phase = "committed".into();
         manager.store.commit(&snapshot, &stored, &[]).unwrap();
         manager.router.publish(snapshot, true);
+    }
+    #[tokio::test]
+    async fn binding_requires_a_passing_test_and_existing_failures_remain_visible() {
+        use super::super::model::test_data::binding;
+        let manager = queued_manager(2, 3);
+        fixture_snapshot(&manager, "https://example.invalid/sub", 2).await;
+        let accounts =
+            crate::account::store::AccountStore::new(manager.store.database_for_test()).unwrap();
+        accounts
+            .upsert(
+                &serde_json::from_value(json!({"user":{"email":"health@test"},
+            "device_id":"1".repeat(64),"access_token":"rca_fixture"}))
+                .unwrap(),
+            )
+            .unwrap();
+        let account_id = manager.account_id("health@test").unwrap();
+        let mut snapshot = manager.router.snapshot();
+        snapshot
+            .bindings
+            .insert(account_id, binding(account_id, "node1"));
+        manager.router.publish_metadata(snapshot);
+        for failed in [false, true] {
+            let mut snapshot = manager.router.snapshot();
+            let node = snapshot.nodes.get_mut("node0").unwrap();
+            if failed {
+                node.delay_checked_at = Some(now());
+                node.delay_error_code = Some("proxy_test_failed".into());
+            }
+            manager.router.publish_metadata(snapshot);
+            let op = manager
+                .enqueue(
+                    Action::SetBinding {
+                        email: "health@test".into(),
+                        node_id: "node0".into(),
+                        expected_revision: 1,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            manager
+                .run_operation(manager.store.operation(&op.id).unwrap())
+                .await;
+            assert_eq!(
+                manager.operation(&op.id).unwrap().code.as_deref(),
+                Some(if failed {
+                    "proxy_test_failed"
+                } else {
+                    "proxy_node_untested"
+                })
+            );
+            assert_eq!(
+                manager.router.snapshot().bindings[&account_id].node_id,
+                "node1"
+            );
+        }
+        let mut snapshot = manager.router.snapshot();
+        let node = snapshot.nodes.get_mut("node1").unwrap();
+        node.delay_checked_at = Some(now());
+        node.delay_ms = Some(42);
+        manager.router.publish_metadata(snapshot);
+        let op = manager
+            .enqueue(
+                Action::SetBinding {
+                    email: "health@test".into(),
+                    node_id: "node1".into(),
+                    expected_revision: 1,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .run_operation(manager.store.operation(&op.id).unwrap())
+            .await;
+        assert_eq!(manager.operation(&op.id).unwrap().phase, "committed");
+        let view = manager.binding_view("health@test").unwrap().unwrap();
+        assert_eq!(view["test_status"], "passed");
+        assert_eq!(view["revision"], 2);
+        let mut snapshot = manager.router.snapshot();
+        let node = snapshot.nodes.get_mut("node1").unwrap();
+        node.delay_ms = None;
+        node.delay_error_code = Some("proxy_test_failed".into());
+        manager.router.publish_metadata(snapshot);
+        let view = manager.binding_view("health@test").unwrap().unwrap();
+        assert_eq!(view["test_status"], "failed");
+        assert_eq!(view["node_id"], "node1");
+        assert_eq!(view["delay_error_code"], "proxy_test_failed");
+        assert_eq!(manager.router.snapshot().bindings[&account_id].revision, 2);
+    }
+    #[tokio::test]
+    async fn test_all_covers_more_than_twenty_nodes_and_skips_missing_or_disabled() {
+        let manager = queued_manager(2, 3);
+        fixture_snapshot(&manager, "https://example.invalid/sub", 25).await;
+        let mut snapshot = manager.router.snapshot();
+        snapshot.nodes.get_mut("node0").unwrap().presence = "missing".into();
+        snapshot.subscriptions.get_mut("sub1").unwrap().enabled = false;
+        manager.router.publish_metadata(snapshot);
+        let all = manager
+            .enqueue(Action::TestAllNodes, Some("all".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .enqueue(Action::TestAllNodes, Some("all-again".into()))
+                .await
+                .unwrap()
+                .id,
+            all.id
+        );
+        let worker = tokio::spawn(manager.clone().worker());
+        // No core: every selected child must report failure without dropping other results.
+        let done = manager.wait(&all.id).await.unwrap();
+        let result = done.result.unwrap();
+        assert_eq!(result["total"], 23);
+        assert_eq!(result["completed"], 23);
+        assert_eq!(result["succeeded"], 0);
+        assert!(
+            result["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["success"] == false
+                    && item["target_id"] != "node0"
+                    && item["target_id"] != "node1")
+        );
+        manager.stopping.store(true, Ordering::SeqCst);
+        worker.await.unwrap();
+        let empty = queued_manager(2, 3);
+        let op = empty.enqueue(Action::TestAllNodes, None).await.unwrap();
+        empty
+            .run_operation(empty.store.operation(&op.id).unwrap())
+            .await;
+        assert_eq!(empty.operation(&op.id).unwrap().result.unwrap()["total"], 0);
     }
     #[tokio::test]
     async fn duplicate_jobs_keep_each_retry_key_and_reject_changed_batch_bodies() {
@@ -1654,9 +1847,12 @@ mod tests {
         let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (a, p, c) = (active.clone(), peak.clone(), calls.clone());
+        let fail_node3 = Arc::new(AtomicBool::new(true));
+        let server_failure = fail_node3.clone();
         let server = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let (a, p, c) = (a.clone(), p.clone(), c.clone());
+                let server_failure = server_failure.clone();
                 tokio::spawn(async move {
                     let mut data = vec![0; 4096];
                     let length = stream.read(&mut data).await.unwrap();
@@ -1666,11 +1862,12 @@ mod tests {
                     let n = a.fetch_add(1, Ordering::SeqCst) + 1;
                     p.fetch_max(n, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(200)).await;
-                    let body = if request.contains("node3/") {
-                        r#"{"delay":0}"#
-                    } else {
-                        r#"{"delay":42}"#
-                    };
+                    let body =
+                        if request.contains("node3/") && server_failure.load(Ordering::SeqCst) {
+                            r#"{"delay":0}"#
+                        } else {
+                            r#"{"delay":42}"#
+                        };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
                         body.len()
@@ -1687,6 +1884,16 @@ mod tests {
             s
         });
         fixture_snapshot(&manager, "https://example.invalid/sub", 5).await;
+        let accounts =
+            crate::account::store::AccountStore::new(manager.store.database_for_test()).unwrap();
+        accounts.upsert(&serde_json::from_value(json!({"user":{"email":"bound-test@fixture"},"device_id":"1".repeat(64),"access_token":"rca_fixture"})).unwrap()).unwrap();
+        let account_id = manager.account_id("bound-test@fixture").unwrap();
+        let mut snapshot = manager.router.snapshot();
+        snapshot.bindings.insert(
+            account_id,
+            super::super::model::test_data::binding(account_id, "node3"),
+        );
+        manager.router.publish_metadata(snapshot);
         *manager.core.lock().await = Some(Core::new(manager.config()).unwrap());
         let single = manager
             .enqueue(
@@ -1733,6 +1940,28 @@ mod tests {
         assert_eq!(snapshot.nodes["node1"].delay_ms, Some(42));
         assert_eq!(snapshot.nodes["node2"].delay_ms, Some(42));
         assert_eq!(snapshot.nodes["node3"].delay_ms, None);
+        let mut snapshot = manager.router.snapshot();
+        snapshot.subscriptions.get_mut("sub4").unwrap().enabled = false;
+        manager.router.publish_metadata(snapshot);
+        let all = manager.enqueue(Action::TestAllNodes, None).await.unwrap();
+        let result = manager.wait(&all.id).await.unwrap().result.unwrap();
+        assert_eq!(result["total"], 4);
+        assert_eq!(result["succeeded"], 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        let view = manager.binding_view("bound-test@fixture").unwrap().unwrap();
+        assert_eq!(view["test_status"], "failed");
+        assert_eq!(view["node_id"], "node3");
+        fail_node3.store(false, Ordering::SeqCst);
+        let retest = manager
+            .enqueue(Action::TestNode { id: "node3".into() }, None)
+            .await
+            .unwrap();
+        manager.wait(&retest.id).await.unwrap();
+        let view = manager.binding_view("bound-test@fixture").unwrap().unwrap();
+        assert_eq!(view["test_status"], "passed");
+        assert_eq!(view["revision"], 1);
+        assert!(manager.store.load().unwrap().nodes["node3"].test_passed());
         manager.shutdown().await;
         worker.await.unwrap();
         server.abort();
@@ -1867,7 +2096,10 @@ mod tests {
         )
         .unwrap();
         let node_id = nodes[0].id.clone();
-        snapshot.nodes.insert(node_id.clone(), nodes[0].clone());
+        let mut tested_node = nodes[0].clone();
+        tested_node.delay_checked_at = Some(now());
+        tested_node.delay_ms = Some(1);
+        snapshot.nodes.insert(node_id.clone(), tested_node);
         let init = Operation {
             id: id(),
             phase: "committed".into(),

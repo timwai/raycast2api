@@ -41,6 +41,22 @@ pub struct Node {
     pub first_seen_at: u64,
     pub last_seen_at: u64,
 }
+impl Node {
+    pub fn test_passed(&self) -> bool {
+        self.delay_checked_at.is_some()
+            && self.delay_ms.is_some_and(|delay| delay > 0)
+            && self.delay_error_code.is_none()
+    }
+    pub fn test_status(&self) -> &'static str {
+        if self.test_passed() {
+            "passed"
+        } else if self.delay_checked_at.is_some() || self.delay_error_code.is_some() {
+            "failed"
+        } else {
+            "untested"
+        }
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Binding {
     pub account_id: i64,
@@ -177,6 +193,27 @@ pub(crate) mod test_data {
 #[cfg(test)]
 mod tests {
     use super::{test_data::*, *};
+    #[test]
+    fn only_tested_successful_nodes_can_be_selected_and_config_changes_reset_results() {
+        let mut tested = node("node", "sub", "present");
+        assert_eq!(tested.test_status(), "untested");
+        tested.delay_ms = Some(42);
+        assert!(
+            !tested.test_passed(),
+            "a delay alone is not a completed test"
+        );
+        tested.delay_checked_at = Some(100);
+        assert!(tested.test_passed());
+        tested.delay_error_code = Some("proxy_test_failed".into());
+        assert_eq!(tested.test_status(), "failed");
+        let mut snapshot = Snapshot::default();
+        snapshot.nodes.insert(tested.id.clone(), tested);
+        let mut changed = node("node", "sub", "present");
+        changed.config_fingerprint = "new-config".into();
+        snapshot.replace_subscription_nodes("sub", vec![changed]);
+        assert_eq!(snapshot.nodes["node"].test_status(), "untested");
+        assert!(!snapshot.nodes["node"].test_passed());
+    }
     #[test]
     fn refresh_replaces_unbound_nodes_but_preserves_bound_tombstones_and_other_subscriptions() {
         let mut snapshot = Snapshot::default();

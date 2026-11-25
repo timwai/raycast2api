@@ -156,6 +156,20 @@ pub async fn test_batch(
     )
     .await
 }
+pub async fn test_all(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<ManagementIdentity>,
+) -> Result<(StatusCode, Json<Operation>), GatewayError> {
+    enqueue(
+        state,
+        headers,
+        identity,
+        "nodes/test-all",
+        Action::TestAllNodes,
+    )
+    .await
+}
 fn page(items: Vec<Value>, p: List) -> Result<Json<Value>, GatewayError> {
     let page = p.page.unwrap_or(1);
     let size = p.page_size.unwrap_or(50);
@@ -325,6 +339,10 @@ pub async fn nodes(
                 json!(snap.subscriptions.get(&n.subscription_id).map(|s| &s.name));
             v["binding_count"] =
                 json!(snap.bindings.values().filter(|b| b.node_id == n.id).count());
+            v["test_status"] = json!(n.test_status());
+            v["selectable"] = json!(
+                n.presence == "present" && v["subscription_enabled"] == true && n.test_passed()
+            );
             v
         })
         .collect::<Vec<_>>();
@@ -425,6 +443,84 @@ mod tests {
         http::{Method, Request},
     };
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn node_list_exposes_test_eligibility_and_test_all_requires_authentication() {
+        let state = crate::server::state::compact_test_state();
+        let mut snapshot = state.proxy_manager.router.snapshot();
+        snapshot.subscriptions.insert(
+            "sub".into(),
+            serde_json::from_value(json!({
+                "id":"sub","name":"sub","enabled":true,"refresh_interval_secs":21600,
+                "revision":1,"created_at":1,"updated_at":1
+            }))
+            .unwrap(),
+        );
+        for (id, status) in [
+            ("passed", "passed"),
+            ("failed", "failed"),
+            ("untested", "untested"),
+        ] {
+            let mut node: crate::proxy_manager::Node = serde_json::from_value(json!({
+                "id":id,"subscription_id":"sub","mihomo_name":id,"original_name":id,
+                "protocol":"http","server":"fixture.invalid","server_port":443,
+                "identity_key":id,"presence":"present","first_seen_at":1,"last_seen_at":1
+            }))
+            .unwrap();
+            if status != "untested" {
+                node.delay_checked_at = Some(100);
+            }
+            if status == "passed" {
+                node.delay_ms = Some(42);
+            }
+            if status == "failed" {
+                node.delay_error_code = Some("proxy_test_failed".into());
+            }
+            snapshot.nodes.insert(id.into(), node);
+        }
+        state.proxy_manager.router.publish_metadata(snapshot);
+        let app = crate::server::build_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/proxy/nodes/list")
+                    .header("Authorization", "Bearer test-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        for item in body["data"]["items"].as_array().unwrap() {
+            assert_eq!(item["test_status"], item["id"]);
+            assert_eq!(item["selectable"], item["id"] == "passed");
+        }
+        for authenticated in [false, true] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/proxy/nodes/test-all");
+            if authenticated {
+                request = request.header("Authorization", "Bearer test-key");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if authenticated {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            );
+        }
+    }
     #[test]
     fn idempotency_keys_are_isolated_by_authenticated_caller_and_endpoint() {
         let mut headers = HeaderMap::new();
