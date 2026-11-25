@@ -36,6 +36,8 @@ pub use crate::proxies::Transport;
 #[derive(Clone)]
 pub struct RaycastClient {
     pub(crate) http: Client,
+    pub(crate) proxy_manager: Option<Arc<crate::proxy_manager::ProxyManager>>,
+    pub(crate) transport_lease: Option<crate::proxy_manager::router::AccountTransportLease>,
     /// 代理客户端链,与 `settings.proxies` 一一对应;通道顺序由 `proxies_mode` 决定。
     pub(crate) proxies: Vec<(String, Client)>,
     /// chat 专用直连客户端(h2 能力,对齐 undici fetch)。
@@ -50,7 +52,35 @@ pub struct RaycastClient {
     #[cfg(test)]
     pub(crate) models_url: Option<String>,
     #[cfg(test)]
+    pub(crate) files_url: Option<String>,
+    #[cfg(test)]
     pub(crate) oauth_url: Option<String>,
+}
+
+/// The response and the actual account route must travel together across retries.
+pub(crate) struct AccountResponse {
+    pub response: reqwest::Response,
+    pub fetch_clients: Vec<Client>,
+    pub lease: Option<crate::proxy_manager::router::AccountTransportLease>,
+}
+impl std::fmt::Debug for AccountResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountResponse")
+            .field("status", &self.response.status())
+            .finish()
+    }
+}
+impl AccountResponse {
+    pub fn new(response: reqwest::Response, client: &RaycastClient) -> Self {
+        Self {
+            response,
+            fetch_clients: client.fetch_channels(),
+            lease: client.transport_lease.clone(),
+        }
+    }
+    pub fn status(&self) -> reqwest::StatusCode {
+        self.response.status()
+    }
 }
 
 impl RaycastClient {
@@ -59,6 +89,8 @@ impl RaycastClient {
     pub fn new(settings: Arc<Settings>, statistics: Arc<StatisticsStore>) -> Self {
         let timeout = settings.upstream_timeout();
         Self {
+            proxy_manager: None,
+            transport_lease: None,
             http: crate::proxies::direct_client(timeout),
             proxies: crate::proxies::build_clients(&settings.proxies, timeout),
             chat_http: crate::proxies::direct_chat_client(timeout),
@@ -71,8 +103,35 @@ impl RaycastClient {
             #[cfg(test)]
             models_url: None,
             #[cfg(test)]
+            files_url: None,
+            #[cfg(test)]
             oauth_url: None,
         }
+    }
+
+    /// Scope every endpoint (including raw uploads and OAuth) to one account route.
+    pub(crate) fn for_account(&self, email: &str, critical: bool) -> Result<Self, GatewayError> {
+        let Some(manager) = &self.proxy_manager else {
+            return Ok(self.clone());
+        };
+        let account_id = manager.account_id(email)?;
+        if let Some(lease) = &self.transport_lease
+            && lease.account_id == account_id
+            && !critical
+        {
+            lease.check()?;
+            return Ok(self.clone());
+        }
+        let lease = manager.router.lease(account_id, critical)?;
+        let mut client = self.clone();
+        if let (Some(got), Some(chat)) = (&lease.got, &lease.chat) {
+            client.http = got.clone();
+            client.chat_http = chat.clone();
+            client.proxies.clear();
+            client.chat_proxies.clear();
+        }
+        client.transport_lease = Some(lease);
+        Ok(client)
     }
 
     /// Fetch clients in proxy-channel order, for auxiliary upstream downloads
@@ -81,6 +140,13 @@ impl RaycastClient {
     /// proxies first. Uses the chat (h2-capable) pool — the real client
     /// downloads these through the same Node process as chat.
     pub(crate) fn fetch_channels(&self) -> Vec<Client> {
+        if self
+            .transport_lease
+            .as_ref()
+            .is_some_and(|lease| lease.bound())
+        {
+            return vec![self.chat_http.clone()];
+        }
         crate::proxies::channels(
             self.settings.proxies_mode,
             &self.chat_http,
@@ -287,9 +353,13 @@ impl RaycastClient {
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
         headers.insert("Accept", HeaderValue::from_static("application/json"));
 
+        #[cfg(test)]
+        let files_url = self.files_url.as_deref().unwrap_or(RAYCAST_FILES_URL);
+        #[cfg(not(test))]
+        let files_url = RAYCAST_FILES_URL;
         let request = self
             .http
-            .post(RAYCAST_FILES_URL)
+            .post(files_url)
             .headers(headers)
             .body(body)
             .build()?;
@@ -319,7 +389,13 @@ impl RaycastClient {
             .body(bytes.to_vec())
             .timeout(self.settings.upstream_timeout())
             .build()?;
-        self.http.execute(put_request).await?.error_for_status()?;
+        if self.transport_lease.is_some() {
+            self.send_got(put_request, None, None)
+                .await?
+                .error_for_status()?;
+        } else {
+            self.http.execute(put_request).await?.error_for_status()?;
+        }
 
         Ok(registered.id)
     }

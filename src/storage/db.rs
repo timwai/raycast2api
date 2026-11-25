@@ -27,8 +27,10 @@ impl Db {
         }
         let mut conn = SqliteConnection::establish(path)
             .map_err(|e| format!("failed to open sqlite db '{path}': {e}"))?;
-        conn.batch_execute("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
-            .map_err(|e| format!("failed to configure sqlite db '{path}': {e}"))?;
+        conn.batch_execute(
+            "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;",
+        )
+        .map_err(|e| format!("failed to configure sqlite db '{path}': {e}"))?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
 

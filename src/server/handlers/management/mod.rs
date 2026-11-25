@@ -5,6 +5,7 @@ mod api_keys;
 pub mod login;
 pub mod logs;
 pub mod models;
+pub mod proxy;
 pub mod statistics;
 
 use axum::{
@@ -17,6 +18,25 @@ use crate::server::state::SharedState;
 /// Session/API-key-protected routes, relative to /v1; login is public.
 pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
+        .route("/proxy/subscriptions/list", post(proxy::subscriptions))
+        .route("/proxy/subscriptions/create", post(proxy::create))
+        .route(
+            "/proxy/subscriptions/create-batch",
+            post(proxy::create_batch),
+        )
+        .route("/proxy/subscriptions/update", post(proxy::update))
+        .route("/proxy/subscriptions/delete", post(proxy::delete))
+        .route("/proxy/subscriptions/refresh", post(proxy::refresh))
+        .route("/proxy/subscriptions/refresh-all", post(proxy::refresh_all))
+        .route("/proxy/nodes/list", post(proxy::nodes))
+        .route("/proxy/nodes/detail", post(proxy::node_detail))
+        .route("/proxy/nodes/test", post(proxy::test))
+        .route("/proxy/nodes/test-batch", post(proxy::test_batch))
+        .route("/proxy/bindings/list", post(proxy::bindings))
+        .route("/proxy/bindings/set", post(proxy::set_binding))
+        .route("/proxy/bindings/delete", post(proxy::delete_binding))
+        .route("/proxy/operations/detail", post(proxy::operation))
+        .route("/proxy/status", get(proxy::status).post(proxy::status))
         .route("/accounts/list", post(accounts::list))
         .route("/accounts/detail", post(accounts::detail))
         .route(

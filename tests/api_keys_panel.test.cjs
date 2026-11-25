@@ -18,6 +18,7 @@ function mount(file, globals = {}) {
         },
         html: (parts, ...values) => ({ parts, values }),
         nothing: null,
+        ProxyRequests: class { clear() {} run(_resource, _path, _body, send) { return send({}); } },
         customElements: { define: (_, element) => { Element = element; } },
         ...globals
     }, { filename: file });

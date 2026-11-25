@@ -12,8 +12,9 @@ const MAX_ERROR_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Wrap JSON responses from gateway API routes in the shared REST envelope.
 /// Inference protocol routes and health probes keep their existing contracts.
 pub async fn response_format(request: Request, next: Next) -> Response {
-    let no_store = request.uri().path().starts_with("/v1/api-keys/");
-    let mut response = format_response(request, next, no_store).await;
+    let api_keys = request.uri().path().starts_with("/v1/api-keys/");
+    let no_store = api_keys || request.uri().path().starts_with("/v1/proxy/");
+    let mut response = format_response(request, next, api_keys).await;
     if no_store {
         response.headers_mut().insert(
             axum::http::header::CACHE_CONTROL,

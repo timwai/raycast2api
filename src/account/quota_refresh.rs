@@ -187,6 +187,7 @@ pub async fn fetch_info(
     email: &str,
 ) -> Result<Option<AccountInfo>, GatewayError> {
     let account = store.get_for_upstream(email)?;
+    let client = client.for_account(email, false)?;
     let me = match client.fetch_me(&account.access_token).await {
         Ok(me) => me,
         Err(GatewayError::TokenInvalid { .. }) => return Ok(None),
@@ -216,6 +217,7 @@ pub async fn fetch_info(
             }
             Err(GatewayError::TokenInvalid { .. }) => return Ok(None),
             Err(err) if err.is_account_dead() => return Err(err),
+            Err(err @ GatewayError::Admission { .. }) => return Err(err),
             Err(GatewayError::Upstream { status, .. }) => {
                 tracing::debug!(
                     "account refresh: /me/trial_status returned {status} (非试用号属正常)"

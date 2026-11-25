@@ -1,12 +1,21 @@
 {
-    "host": "0.0.0.0",
-    "port": 8787,
-    "api_key": "replace-with-your-global-api-key",
-    "raycast_signature_secret": "your-raycast-signature-secret",
-    "dashboard_password": "your-dashboard-password-here",
-    "dashboard_session_secret": "replace-with-a-random-secret-at-least-32-bytes",
-    "proxies": [],
-    "proxies_mode": "direct",
-    "upstream_timeout_secs": 20
+  "host": "0.0.0.0",
+  "port": 8787,
+  "api_key": "replace-with-your-global-api-key",
+  "raycast_signature_secret": "your-raycast-signature-secret",
+  "dashboard_password": "your-dashboard-password-here",
+  "dashboard_session_secret": "replace-with-a-random-secret-at-least-32-bytes",
+  "proxies": [],
+  "proxies_mode": "direct",
+  "upstream_timeout_secs": 20,
+  "proxy_manager": {
+    "enabled": false,
+    "binary_path": "/usr/local/bin/mihomo",
+    "expected_version": "v1.19.34",
+    "work_dir": "./store/mihomo",
+    "controller_addr": "127.0.0.1:19090",
+    "port_start": 18000,
+    "port_end": 18999,
+    "refresh_interval_secs": 21600
+  }
 }
-

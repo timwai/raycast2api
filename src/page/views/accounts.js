@@ -86,6 +86,9 @@ class AccountCard extends LitElement {
                         >
                     </div>
                 </div>
+                <p class="mt-2 truncate text-xs ${a.proxy_binding && a.proxy_binding.status !== 'active' ? 'text-amber-700' : 'text-muted'}" title=${a.proxy_binding?.reason || ''}>
+                    代理：${a.proxy_binding ? (a.proxy_binding.node_name || a.proxy_binding.node_id) + (a.proxy_binding.status === 'active' ? '' : '（已阻断）') : '现有全局策略'}
+                </p>
                 <div
                     class="my-2 flex items-center justify-between gap-2 [&>div]:flex [&>div]:min-w-0 [&>div]:items-baseline [&>div]:gap-1.5"
                 >
@@ -168,6 +171,7 @@ class AccountCard extends LitElement {
                     .disabled=${this.busy}
                     @button-click=${() => action('toggle', !enabled)}
                 ></ui-button>
+                <ui-button class="inline-flex" label="代理出口" .disabled=${this.busy} @button-click=${() => action('proxy')}></ui-button>
                 <ui-button
                     class="inline-flex"
                     label="删除"
@@ -345,6 +349,7 @@ class AccountsPanel extends LitElement {
     }
     async accountAction(e) {
         const { action, email, value } = e.detail;
+        if (action === 'proxy') { this.dispatchEvent(new CustomEvent('manage-account-proxy', { detail: { email }, bubbles: true, composed: true })); return; }
         const resetPriority = () => {
             // Lit 对未变化的绑定值不会重写 DOM,须主动回退未保存的输入。
             const input = this.querySelector(`input[data-priority-email="${CSS.escape(email)}"]`);

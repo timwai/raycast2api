@@ -119,6 +119,7 @@ impl From<(RaycastMe, RaycastCredits)> for AccountInfo {
 /// `POST /v1/accounts/list` 返回的一条账号视图:token 掩码,含额度与可用状态。
 #[derive(Debug, Serialize)]
 pub struct AccountView {
+    pub proxy_binding: Option<serde_json::Value>,
     pub email: String,
     pub tag: Option<String>,
     pub enabled: bool,

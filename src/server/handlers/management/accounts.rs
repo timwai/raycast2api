@@ -60,7 +60,15 @@ pub async fn list(
         .accounts
         .list_page(page, page_size, params.status.as_deref())?;
     Ok(Json(Page::new(
-        page.items.into_iter().map(account_view).collect(),
+        page.items
+            .into_iter()
+            .map(|row| {
+                let binding = state.proxy_manager.binding_view(&row.email)?;
+                let mut view = account_view(row);
+                view.proxy_binding = binding;
+                Ok(view)
+            })
+            .collect::<Result<Vec<_>, GatewayError>>()?,
         page.total,
         page.page,
         page.page_size,
@@ -71,6 +79,7 @@ fn account_view(row: AccountRow) -> AccountView {
     let status = row.status_at(unix_secs() as i64);
     let schedulable = status == AccountStatus::Available;
     AccountView {
+        proxy_binding: None,
         email: row.email,
         tag: row.tag,
         enabled: row.enabled,
@@ -119,7 +128,10 @@ pub async fn detail(
     let row = state.accounts.get(&request.email)?.ok_or_else(|| {
         GatewayError::NotFound(format!("no account with email {}", request.email))
     })?;
-    Ok(Json(account_view(row)))
+    let binding = state.proxy_manager.binding_view(&row.email)?;
+    let mut view = account_view(row);
+    view.proxy_binding = binding;
+    Ok(Json(view))
 }
 
 /// `POST /v1/accounts/create` — 新增或更新账号(按 email upsert)。
@@ -188,9 +200,45 @@ pub async fn delete(
     State(state): State<SharedState>,
     Json(request): Json<DeleteParams>,
 ) -> Result<Json<DeleteResponse>, GatewayError> {
-    let deleted = state
+    let filter = request.status.as_deref().filter(|value| !value.is_empty());
+    if request.email.is_none() && filter.is_none() {
+        return Err(GatewayError::BadRequest(
+            "email or status is required".into(),
+        ));
+    }
+    let status_filter = filter
+        .map(|value| {
+            AccountStatus::parse(value).ok_or_else(|| {
+                GatewayError::BadRequest(
+                    "status must be one of available, cooldown, unavailable, disabled".into(),
+                )
+            })
+        })
+        .transpose()?;
+    let selected = state
         .accounts
-        .delete(request.email.as_deref(), request.status.as_deref())?;
+        .list_all()?
+        .into_iter()
+        .filter(|row| {
+            request
+                .email
+                .as_ref()
+                .is_none_or(|email| *email == row.email)
+                && status_filter.is_none_or(|status| row.status_at(unix_secs() as i64) == status)
+        })
+        .collect::<Vec<_>>();
+    let deleted = selected.len();
+    if deleted > 0 {
+        let ids = selected
+            .iter()
+            .map(|row| state.proxy_manager.account_id(&row.email))
+            .collect::<Result<Vec<_>, _>>()?;
+        let operation = state
+            .proxy_manager
+            .enqueue(crate::proxy_manager::Action::DeleteAccounts { ids }, None)
+            .await?;
+        state.proxy_manager.wait(&operation.id).await?;
+    }
     if request.email.is_none() || deleted > 0 {
         return Ok(Json(DeleteResponse { deleted }));
     }
@@ -228,7 +276,9 @@ pub async fn restore(
     let (row, upstream_note) =
         crate::account::service::restore(&state.accounts, &state.dispatcher.client, &request.email)
             .await?;
+    let binding = state.proxy_manager.binding_view(&row.email)?;
     let mut view = account_view(row);
+    view.proxy_binding = binding;
     view.unavailable_reason = upstream_note.clone();
     // note 不该污染 available 语义:查询成功时 reason 已是 None。
     Ok(Json(view).into_response())

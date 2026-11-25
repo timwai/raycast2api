@@ -18,7 +18,16 @@ pub async fn health() -> Response {
 /// Readiness: report `ready` when the backend is believed to be working;
 /// otherwise probe upstream at most once per rate-limit window.
 pub async fn ready(State(state): State<SharedState>) -> Response {
-    if state.accounts.count_available() == 0 {
+    let has_route = state.accounts.list_all().is_ok_and(|accounts| {
+        accounts.iter().any(|account| {
+            state.accounts.get_for_upstream(&account.email).is_ok()
+                && state
+                    .transport_client()
+                    .for_account(&account.email, false)
+                    .is_ok()
+        })
+    });
+    if !has_route {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status":"not ready", "message":"No available accounts"})),

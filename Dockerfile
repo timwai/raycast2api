@@ -1,3 +1,9 @@
+# ---- fixed proxy core ----
+FROM python:3.12-slim AS mihomo
+ARG TARGETARCH
+COPY build/fetch-mihomo.py build/mihomo-lock.json /build/
+RUN python /build/fetch-mihomo.py
+
 # ---- build stage ----
 # Full `rust` image (not -slim) so the C toolchain that `ring` needs is present.
 # Match the runtime's glibc so the release binary runs on Bookworm.
@@ -15,6 +21,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --user-group --create-home app
 COPY --from=builder /app/target/release/raycast2api /usr/local/bin/raycast2api
+COPY --from=mihomo /out/mihomo /usr/local/bin/mihomo
+RUN mihomo -v | grep -F v1.19.34
 # The gateway reads config.json / store/ relative to its CWD.
 WORKDIR /app
 # Writable home for the SQLite store (bind-mounted over by compose).
