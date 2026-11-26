@@ -115,6 +115,7 @@ impl RaycastClient {
             return Ok(self.clone());
         };
         let account_id = manager.account_id(email)?;
+        manager.ensure_account_assignment(account_id)?;
         if let Some(lease) = &self.transport_lease
             && lease.account_id == account_id
             && !critical

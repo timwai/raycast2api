@@ -21,6 +21,11 @@ pub struct ProxyManagerConfig {
     pub manual_test_url: String,
     pub manual_test_timeout_ms: u64,
     pub manual_test_concurrency: usize,
+    pub auto_test_enabled: bool,
+    pub auto_test_interval_secs: u64,
+    pub auto_failover_enabled: bool,
+    pub auto_bind_new_accounts: bool,
+    pub auto_selection_max_test_age_secs: u64,
     pub apply_drain_timeout_secs: u64,
     pub apply_timeout_secs: u64,
 }
@@ -44,6 +49,11 @@ impl Default for ProxyManagerConfig {
             manual_test_url: "https://www.gstatic.com/generate_204".into(),
             manual_test_timeout_ms: 5000,
             manual_test_concurrency: 3,
+            auto_test_enabled: true,
+            auto_test_interval_secs: 1800,
+            auto_failover_enabled: true,
+            auto_bind_new_accounts: true,
+            auto_selection_max_test_age_secs: 3600,
             apply_drain_timeout_secs: 15,
             apply_timeout_secs: 60,
         }
@@ -73,6 +83,8 @@ impl ProxyManagerConfig {
             || !(1..=32).contains(&self.subscription_concurrency)
             || !(1..=32).contains(&self.manual_test_concurrency)
             || self.manual_test_timeout_ms == 0
+            || self.auto_test_interval_secs < 60
+            || self.auto_selection_max_test_age_secs < 60
             || self.apply_timeout_secs <= self.apply_drain_timeout_secs
         {
             return Err("invalid proxy manager limits or download route".into());

@@ -6,11 +6,13 @@ mod mihomo;
 mod model;
 pub mod router;
 mod scheduler;
+mod settings;
 mod store;
 mod subscription;
 pub use manager::{Action, ProxyManager, SubscriptionInput};
 pub(crate) use model::id;
 pub use model::{Binding, Node, Operation, Snapshot, Subscription};
+pub use settings::{ProxySettings, SettingsRecord};
 pub(crate) fn error(code: &'static str, message: impl Into<String>) -> crate::error::GatewayError {
     crate::error::GatewayError::Admission {
         status: axum::http::StatusCode::SERVICE_UNAVAILABLE,

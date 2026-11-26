@@ -49,7 +49,7 @@ function mount(tag = 'proxy-panel') {
     const scope = {
         LitElement: class { requestUpdate() {} dispatchEvent(event) { this.lastEvent = event; } }, html: (parts, ...values) => ({ parts, values }),
         customElements: { define: (name, element) => elements.set(name, element) },
-        message: (...args) => notices.push(args), formatDate: () => '', setTimeout, Date,
+        message: (...args) => notices.push(args), formatDate: () => '', setTimeout, Date, structuredClone,
         CustomEvent: class { constructor(type, options) { this.type = type; Object.assign(this, options); } }
     };
     runInNewContext(readFileSync(join(__dirname, '../src/page/views/proxy.js'), 'utf8')
@@ -148,4 +148,38 @@ test('a failed existing binding still allows explicit unbinding', async () => {
     };
     await dialog.save({ preventDefault() {} });
     assert.equal(dialog.lastEvent.type, 'binding-updated');
+});
+
+function renderedText(value) {
+    if (Array.isArray(value)) return Array.from(value).map(renderedText).join('');
+    if (value?.parts) return value.parts.map((part,index)=>part+renderedText(value.values[index])).join('');
+    return value == null || typeof value === 'function' || typeof value === 'object' ? '' : String(value);
+}
+test('exit choices identify bound accounts and unused nodes', () => {
+    const {panel:dialog}=mount('proxy-binding-dialog');
+    dialog.nodes=[{id:'a',original_name:'node-a',subscription_id:'sub',presence:'present',subscription_enabled:true,test_status:'passed',bound_accounts:['one@fixture','two@fixture'],delay_ms:15},
+        {id:'b',original_name:'node-b',subscription_id:'sub',presence:'present',subscription_enabled:true,test_status:'passed',binding_count:0,delay_ms:25}];
+    const text=renderedText(dialog.render());
+    assert.match(text,/已绑定：one@fixture、two@fixture/);assert.match(text,/未绑定/);
+});
+test('proxy settings save all fields with their revision and display the saved values',async()=>{
+    const {panel,notices}=mount();let saved=null;
+    panel.request=async(path,body)=>{
+        if(path==='settings') return {revision:saved?5:4,settings:saved||{auto_test_enabled:true,auto_test_interval_secs:1800,manual_test_concurrency:3}};
+        assert.equal(path,'settings/update');assert.equal(body.expected_revision,4);saved=body.settings;
+        return {id:'settings',phase:'committed'};
+    };
+    await panel.toggleSettings();assert.equal(panel.showSettings,true);
+    panel.setSetting('manual_test_concurrency',6);
+    await panel.saveSettings({preventDefault(){}});
+    assert.equal(saved.manual_test_concurrency,6);assert.equal(saved.auto_test_interval_secs,1800);
+    assert.equal(panel.preferences.revision,5);assert.equal(panel.settingsBusy,false);
+    assert.ok(notices.some(([text])=>text.includes('已保存并生效')));
+});
+test('saving the global strategy explicitly cancels a pending automatic assignment',async()=>{
+    const {panel:dialog}=mount('proxy-binding-dialog');
+    dialog.account={email:'pending@fixture',proxy_binding:{status:'pending',node_id:null,revision:0}};
+    dialog.selected='';dialog.close=()=>{};let called=false;
+    dialog.request=async(path,body)=>{assert.equal(path,'bindings/delete');assert.equal(body.expected_revision,0);called=true;return {id:'cancel',phase:'committed'};};
+    await dialog.save({preventDefault(){}});assert.equal(called,true);
 });

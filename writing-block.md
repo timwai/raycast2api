@@ -303,11 +303,11 @@ proxy-groups:
 
 空组默认回退是 COMPATIBLE，而该内置策略等价于直连，必须显式覆盖。参见[官方组配置](https://wiki.metacubex.one/en/config/proxy-groups/)、[内置策略](https://wiki.metacubex.one/en/config/proxies/built-in/)及固定版本 [parser.go](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/adapter/outboundgroup/parser.go)、[selector.go](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/adapter/outboundgroup/selector.go)。
 
-### 6.4 禁止自动探测
+### 6.4 禁止核心隐式探测
 
 Provider health-check.enable 为 false；组不配置健康检查 URL，interval 为 0；不采用 url-test、fallback、load-balance，不用 lazy: true 代替禁用。首次加载、重载、失败触发等隐式探测也要通过真实核心测试证明没有外联。
 
-Provider 和组的健康检查是不同入口，依据[官方 Provider 配置](https://wiki.metacubex.one/en/config/proxy-providers/)及固定版本 [healthcheck.go](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/adapter/provider/healthcheck.go)。允许本地控制器状态轮询，不通过访问 Raycast/外部站点判断核心健康。
+Provider 和组的健康检查是不同入口，依据[官方 Provider 配置](https://wiki.metacubex.one/en/config/proxy-providers/)及固定版本 [healthcheck.go](https://github.com/MetaCubeX/mihomo/blob/v1.19.34/adapter/provider/healthcheck.go)。允许本地控制器状态轮询，不通过访问 Raycast/外部站点判断核心健康。用户开启定时测速后，由网关显式调用受限测速接口，默认每 30 分钟一次；核心隐式健康检查保持关闭。
 
 Listener 的 proxy 必须是存在的组名且不为空，listen 显式为 127.0.0.1；依据[官方 listener 字段](https://wiki.metacubex.one/en/config/inbound/listeners/)。全局 MATCH,REJECT 同时拒绝误入规则引擎的请求。
 
@@ -465,17 +465,25 @@ AccountProxyRouter 返回三种明确结果：
 
 现有账号列表/详情增加 proxy_binding，含节点、订阅名称、端口、revision、generation、运行状态和原因。null 只表示没有持久化绑定，不能表示核心失效。
 
-### 10.3 手动测速
+### 10.3 页面设置与自动分配
+
+运行参数通过受认证的 settings 接口持久化到 proxy_preferences，带 revision。页面设置覆盖文件中的同名运行参数；保存后更新并发准入，降低并发不会取消已执行的任务。核心路径、版本、端口和密钥等部署参数由文件/环境变量管理。
+
+proxy_auto_accounts 在新增账号的同一 SQLite 事务内登记，避免账号已可见而自动绑定尚未准备的空窗。等待分配阻断普通请求；显式解绑在提交事务中撤销登记，更新既有账号不登记。自动分配与故障换绑在全局应用锁内按最新快照选取近期测试通过、未绑定的最低延迟节点，逐个占用，复用原端口。必要 token 轮换的在途租约先排空，不跨出口重放。
+
+定时测速的 next_test_at、operation_id 持久化；同批未结束不重复调度。完成后错峰计算下一周期，默认 1800 秒；没有空闲候选时等待后续测试/人工操作，保留原故障绑定。自动测速只测节点固定 URL，不使用账号凭据。
+
+### 10.4 测速
 
 一键全量测试不受列表筛选、分页和勾选 20 项上限影响；跳过缺失节点和停用订阅，同节点任务仍合并。全量操作只保留与手动测速并发数相同的在途子任务窗口。结果包含 completed/total/succeeded 和逐项结果。
 
-新建/更换绑定只允许 delay_checked_at 存在、delay_ms > 0 且无 delay_error_code 的节点。配置指纹变化后旧测试结果失效，必须重新测试。已有绑定测试失败不自动解绑或更换，账号卡片显示红色失败提示和最近测试时间；重测通过后清除。
+新建/更换绑定只允许 delay_checked_at 存在、delay_ms > 0 且无 delay_error_code 的节点。配置指纹变化后旧测试结果失效，必须重新测试。已有绑定测试失败会阻断；自动故障转移开启时按近期测试通过、未绑定、低延迟顺序选择替代节点，使用原端口显式换绑。没有候选时保留原绑定并提示；重测通过后清除。
 
 只在显式操作时测试，不带账号 token。服务端固定测试目标与超时，默认 https://www.gstatic.com/generate_204、5000 ms，并发 3，每次最多 20 节点；同节点重复任务合并。单节点与批量均先持久化再返回 202，完成后可发起新一轮测试。
 
 调用单节点 GET /providers/proxies/{provider}/{node}/healthcheck，正确编码路径/参数；不用 Provider 级 healthcheck 隐式测试全部。前端不能提供任意目标 URL。节点缺失、订阅停用或核心不可用时拒绝测试。
 
-延迟仅反映该时刻该 URL 可达性，不等于 Raycast 可用；未知/超时不自动停用账号、不触发其他节点。
+延迟仅反映该时刻该 URL 可达性，不等于 Raycast 可用；未知/超时不自动停用账号；测试确认故障后由管理器按自动故障转移开关调度显式换绑。
 
 ### 10.4 UI
 
@@ -638,7 +646,7 @@ src/proxy_manager/
 
 ## 16. V1 范围外与实现取舍
 
-不包含 URI/Base64/Surge 订阅、系统代理/TUN/DNS 劫持、自动换节点、负载均衡、链式代理、前端直接控制核心、多实例共享核心/数据库和在线密钥轮换。
+不包含 URI/Base64/Surge 订阅、系统代理/TUN/DNS 劫持、负载均衡、链式代理、前端直接控制核心、多实例共享核心/数据库和在线密钥轮换。
 
 完整代次重载会短暂暂停绑定账号新请求，必要时中断普通在途请求。这是 V1 为明确连接归属和恢复边界采用的取舍。未来增量更新须重新验证选择状态、旧连接与崩溃恢复，不能直接删除屏障。
 

@@ -1,6 +1,5 @@
 //! Independent limits keep slow downloads/tests from occupying mutation capacity.
-use std::{sync::Arc, time::Duration};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobClass {
@@ -9,29 +8,14 @@ pub enum JobClass {
     Control,
     Batch,
 }
-pub struct Limits {
-    downloads: Arc<Semaphore>,
-    tests: Arc<Semaphore>,
-    control: Arc<Semaphore>,
-    batches: Arc<Semaphore>,
-}
-impl Limits {
-    pub fn new(downloads: usize, tests: usize) -> Self {
-        Self {
-            downloads: Arc::new(Semaphore::new(downloads)),
-            tests: Arc::new(Semaphore::new(tests)),
-            control: Arc::new(Semaphore::new(1)),
-            batches: Arc::new(Semaphore::new(4)),
+impl JobClass {
+    pub fn limit(self, config: &super::config::ProxyManagerConfig) -> usize {
+        match self {
+            Self::Download => config.subscription_concurrency,
+            Self::Test => config.manual_test_concurrency,
+            Self::Control => 1,
+            Self::Batch => 4,
         }
-    }
-    pub fn try_acquire(&self, class: JobClass) -> Option<OwnedSemaphorePermit> {
-        let semaphore = match class {
-            JobClass::Download => &self.downloads,
-            JobClass::Test => &self.tests,
-            JobClass::Control => &self.control,
-            JobClass::Batch => &self.batches,
-        };
-        semaphore.clone().try_acquire_owned().ok()
     }
 }
 /// Add up to 10%, capped at five minutes, after the normal refresh interval.
@@ -47,23 +31,6 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn limits_are_independent_and_return_capacity_on_completion() {
-        let limits = Limits::new(2, 3);
-        let a = limits.try_acquire(JobClass::Download).unwrap();
-        let _b = limits.try_acquire(JobClass::Download).unwrap();
-        assert!(limits.try_acquire(JobClass::Download).is_none());
-        let _control = limits.try_acquire(JobClass::Control).unwrap();
-        assert!(limits.try_acquire(JobClass::Control).is_none());
-        let tests = (0..3)
-            .map(|_| limits.try_acquire(JobClass::Test).unwrap())
-            .collect::<Vec<_>>();
-        assert!(limits.try_acquire(JobClass::Test).is_none());
-        drop(a);
-        assert!(limits.try_acquire(JobClass::Download).is_some());
-        drop(tests);
-        assert!(limits.try_acquire(JobClass::Test).is_some());
-    }
     #[test]
     fn randomized_refresh_is_persistent_ready_and_never_early() {
         let times = (0..64)

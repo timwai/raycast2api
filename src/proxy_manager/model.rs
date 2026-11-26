@@ -48,7 +48,9 @@ impl Node {
             && self.delay_error_code.is_none()
     }
     pub fn test_status(&self) -> &'static str {
-        if self.test_passed() {
+        if self.delay_error_code.as_deref() == Some("proxy_test_required") {
+            "untested"
+        } else if self.test_passed() {
             "passed"
         } else if self.delay_checked_at.is_some() || self.delay_error_code.is_some() {
             "failed"
@@ -65,6 +67,10 @@ pub struct Binding {
     pub revision: u64,
     pub created_at: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub automatic_reason: Option<String>,
+    #[serde(default)]
+    pub previous_node_id: Option<String>,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -108,6 +114,13 @@ impl Snapshot {
     }
 
     pub fn route_active(&self, binding: &Binding) -> bool {
+        self.route_configured(binding)
+            && self.nodes.get(&binding.node_id).is_some_and(|node| {
+                node.test_status() != "failed" && node.delay_error_code.is_none()
+            })
+    }
+    /// Physical core configuration stays independent of transient test results.
+    pub fn route_configured(&self, binding: &Binding) -> bool {
         self.nodes.get(&binding.node_id).is_some_and(|node| {
             node.presence == "present"
                 && self
@@ -186,6 +199,8 @@ pub(crate) mod test_data {
             revision: 1,
             created_at: 1,
             updated_at: 1,
+            automatic_reason: None,
+            previous_node_id: None,
         }
     }
 }

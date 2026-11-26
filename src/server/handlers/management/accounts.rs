@@ -144,7 +144,12 @@ pub async fn create(
 ) -> Result<Json<UpsertResponse>, GatewayError> {
     match request {
         UpsertRequest::One(record) => Ok(Json(UpsertResponse::One {
-            result: upsert_label(state.accounts.upsert(&record)?),
+            result: upsert_label(
+                state
+                    .proxy_manager
+                    .import_accounts(&state.accounts, &[record])
+                    .await?[0],
+            ),
         })),
         UpsertRequest::Many(items) => {
             if items.is_empty() {
@@ -168,8 +173,9 @@ pub async fn create(
                 })
                 .collect::<Result<Vec<_>, GatewayError>>()?;
             let results = state
-                .accounts
-                .upsert_batch(&records)?
+                .proxy_manager
+                .import_accounts(&state.accounts, &records)
+                .await?
                 .into_iter()
                 .map(upsert_label)
                 .collect();

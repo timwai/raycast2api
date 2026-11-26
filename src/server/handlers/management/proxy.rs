@@ -13,6 +13,43 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSettings {
+    expected_revision: u64,
+    settings: crate::proxy_manager::ProxySettings,
+}
+pub async fn settings(State(state): State<SharedState>) -> Json<Value> {
+    let config = state.proxy_manager.config();
+    let preferences = state.proxy_manager.settings_view();
+    Json(json!({"revision":preferences.revision,
+        "settings":preferences.settings,
+        "automation":state.proxy_manager.automation_status().unwrap_or(Value::Null),
+        "deployment":{"enabled":config.enabled,"binary_path":config.binary_path,"expected_version":config.expected_version,
+            "work_dir":config.work_dir,"controller_addr":config.controller_addr,"port_start":config.port_start,"port_end":config.port_end}}))
+}
+pub async fn update_settings(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Extension(identity): Extension<ManagementIdentity>,
+    Json(p): Json<UpdateSettings>,
+) -> Result<(StatusCode, Json<Operation>), GatewayError> {
+    p.settings
+        .apply(&state.proxy_manager.config())
+        .map_err(GatewayError::BadRequest)?;
+    enqueue(
+        state,
+        headers,
+        identity,
+        "settings/update",
+        Action::UpdateSettings {
+            expected_revision: p.expected_revision,
+            settings: p.settings,
+        },
+    )
+    .await
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct List {
@@ -312,6 +349,7 @@ pub async fn nodes(
         ));
     }
     let snap = state.proxy_manager.snapshot();
+    let binding_labels = state.proxy_manager.node_binding_labels()?;
     let mut nodes = snap
         .nodes
         .values()
@@ -339,6 +377,7 @@ pub async fn nodes(
                 json!(snap.subscriptions.get(&n.subscription_id).map(|s| &s.name));
             v["binding_count"] =
                 json!(snap.bindings.values().filter(|b| b.node_id == n.id).count());
+            v["bound_accounts"] = json!(binding_labels.get(&n.id).cloned().unwrap_or_default());
             v["test_status"] = json!(n.test_status());
             v["selectable"] = json!(
                 n.presence == "present" && v["subscription_enabled"] == true && n.test_passed()
