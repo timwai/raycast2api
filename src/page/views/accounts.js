@@ -38,6 +38,7 @@ class AccountCard extends LitElement {
         const state = !enabled ? '已停用' : !a.available ? '不可用' : cooling ? '冷却中' : '可用';
         const status = !enabled ? 'disabled' : !a.available ? 'unavailable' : cooling ? 'cooldown' : 'available';
         const error = a.unavailable_reason || a.error || '';
+        const proxyLabel = a.proxy_binding ? [a.proxy_binding.subscription_name, a.proxy_binding.node_name || a.proxy_binding.node_id].filter(Boolean).join(' / ') : '现有全局策略';
         const proxyTestFailed = a.proxy_binding?.test_status === 'failed';
         const action = (name, value) =>
             this.dispatchEvent(
@@ -87,9 +88,12 @@ class AccountCard extends LitElement {
                         >
                     </div>
                 </div>
-                <p class="mt-2 truncate text-xs ${a.proxy_binding && a.proxy_binding.status !== 'active' ? 'text-amber-700' : 'text-muted'}" title=${a.proxy_binding?.reason || ''}>
-                    代理：${a.proxy_binding ? (a.proxy_binding.node_name || a.proxy_binding.node_id) + (a.proxy_binding.status === 'active' ? '' : '（已阻断）') : '现有全局策略'}
+                <p class="mt-2 truncate text-xs ${a.proxy_binding && a.proxy_binding.status !== 'active' ? 'text-amber-700' : 'text-muted'}" title=${[proxyLabel, a.proxy_binding?.reason].filter(Boolean).join(' · ')}>
+                    代理：${a.proxy_binding ? proxyLabel + (a.proxy_binding.status === 'active' ? '' : '（已阻断）') : '现有全局策略'}
                 </p>
+                ${a.proxy_binding?.status === 'pending' ? html`<p class="mt-2 rounded bg-amber-50 px-2 py-1.5 text-xs text-amber-800">等待分配测试通过的空闲节点；可手动选择出口。</p>` : ''}
+                ${a.proxy_binding?.auto_failover_pending ? html`<p class="mt-2 text-xs text-amber-800">故障转移等待可用空闲节点。</p>` : ''}
+                ${a.proxy_binding?.automatic_reason === 'failover' ? html`<p class="mt-2 text-xs text-blue-700">已自动转移出口${a.proxy_binding.updated_at ? ' · ' + this.date(a.proxy_binding.updated_at) : ''}</p>` : ''}
                 ${proxyTestFailed ? html`<p role="alert" class="mt-2 rounded bg-red-50 px-2 py-1.5 text-xs text-red-700">代理节点测试失败，请重测或更换出口。${a.proxy_binding.delay_checked_at ? html`<span class="block mt-1">最近测试：${this.date(a.proxy_binding.delay_checked_at)}</span>` : ''}</p>` : ''}
                 <div
                     class="my-2 flex items-center justify-between gap-2 [&>div]:flex [&>div]:min-w-0 [&>div]:items-baseline [&>div]:gap-1.5"

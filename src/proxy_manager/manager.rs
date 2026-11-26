@@ -5,7 +5,8 @@ use super::{
     mihomo::Core,
     model::*,
     router::AccountProxyRouter,
-    scheduler::{self, JobClass, Limits},
+    scheduler::{self, JobClass},
+    settings::{ProxySettings, SettingsRecord, TestSchedule},
     store::Store,
     subscription,
 };
@@ -20,6 +21,8 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, Notify, RwLock};
+#[path = "automation.rs"]
+mod automation;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +44,11 @@ pub enum Action {
         items: Vec<SubscriptionInput>,
     },
     RefreshAll,
+    ReconcileBindings,
+    UpdateSettings {
+        expected_revision: u64,
+        settings: ProxySettings,
+    },
     TestAllNodes,
     TestNode {
         id: String,
@@ -88,6 +96,7 @@ impl Action {
             Self::Refresh { id } => Some(format!("refresh:{id}")),
             Self::TestNode { id } => Some(format!("test:{id}")),
             Self::RefreshAll => Some("refresh-all".into()),
+            Self::ReconcileBindings => Some("reconcile-bindings".into()),
             Self::TestAllNodes => Some("test-all".into()),
             Self::TestNodes { ids } => {
                 use sha2::Digest;
@@ -115,6 +124,7 @@ impl Action {
 }
 pub struct ProxyManager {
     settings: Arc<Settings>,
+    preferences: std::sync::RwLock<SettingsRecord>,
     store: Store,
     crypto: Option<Crypto>,
     pub router: Arc<AccountProxyRouter>,
@@ -166,6 +176,14 @@ impl ProxyManager {
             Some(file)
         };
         let store = Store::new(db)?;
+        let preferences = store
+            .preference::<SettingsRecord>("settings")
+            .map_err(|_| "cannot read proxy settings")?
+            .unwrap_or_else(|| SettingsRecord {
+                revision: 0,
+                settings: ProxySettings::from_config(&settings.proxy_manager),
+            });
+        preferences.settings.apply(&settings.proxy_manager)?;
         let mut snapshot = store
             .load()
             .map_err(|_| "proxy snapshot could not be loaded")?;
@@ -201,6 +219,7 @@ impl ProxyManager {
         ));
         Ok(Arc::new(Self {
             settings,
+            preferences: std::sync::RwLock::new(preferences),
             store,
             crypto,
             router,
@@ -219,7 +238,7 @@ impl ProxyManager {
             return Ok(());
         }
         if self.config().enabled {
-            let mut core = Core::new(self.config())?;
+            let mut core = Core::new(&self.config())?;
             let snapshot = self.router.snapshot();
             let path = core.generate(&snapshot, self.crypto()?)?;
             core.validate(&path).await?;
@@ -253,8 +272,54 @@ impl ProxyManager {
             manager.maintenance().await;
         });
     }
-    pub fn config(&self) -> &ProxyManagerConfig {
-        &self.settings.proxy_manager
+    pub fn config(&self) -> ProxyManagerConfig {
+        self.preferences
+            .read()
+            .expect("proxy preferences")
+            .settings
+            .apply(&self.settings.proxy_manager)
+            .expect("validated proxy settings")
+    }
+    pub fn settings_view(&self) -> SettingsRecord {
+        self.preferences.read().expect("proxy preferences").clone()
+    }
+    pub async fn import_accounts(
+        self: &Arc<Self>,
+        accounts: &crate::account::store::AccountStore,
+        records: &[crate::account::wire::AccountRecord],
+    ) -> Result<Vec<crate::account::store::UpsertOutcome>, GatewayError> {
+        let _apply = self.apply.lock().await;
+        let cfg = self.config();
+        let result = accounts
+            .upsert_batch_with_auto_binding(records, cfg.enabled && cfg.auto_bind_new_accounts)?;
+        self.wake.notify_one();
+        Ok(result)
+    }
+    pub(crate) fn ensure_account_assignment(&self, account_id: i64) -> Result<(), GatewayError> {
+        if !self.router.snapshot().bindings.contains_key(&account_id)
+            && self.store.pending_auto_accounts()?.contains(&account_id)
+        {
+            return Err(error(
+                "proxy_assignment_pending",
+                "账号正在等待可用的空闲代理节点，请先测速、添加节点或手动选择出口。",
+            ));
+        }
+        Ok(())
+    }
+    pub fn node_binding_labels(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, Vec<String>>, GatewayError> {
+        let accounts = self.store.account_labels()?;
+        let mut labels = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for binding in self.router.snapshot().bindings.values() {
+            if let Some(email) = accounts.get(&binding.account_id) {
+                labels
+                    .entry(binding.node_id.clone())
+                    .or_default()
+                    .push(email.clone());
+            }
+        }
+        Ok(labels)
     }
     fn crypto(&self) -> Result<&Crypto, GatewayError> {
         self.crypto.as_ref().ok_or_else(|| {
@@ -279,7 +344,13 @@ impl ProxyManager {
         let id = self.account_id(email)?;
         let s = self.router.snapshot();
         let Some(b) = s.bindings.get(&id) else {
-            return Ok(None);
+            return Ok(if self.store.pending_auto_accounts()?.contains(&id) {
+                Some(
+                    json!({"node_id":null,"node_name":"等待分配","status":"pending","reason":"proxy_assignment_pending","revision":0}),
+                )
+            } else {
+                None
+            });
         };
         let n = s.nodes.get(&b.node_id);
         let sub = n.and_then(|n| s.subscriptions.get(&n.subscription_id));
@@ -295,6 +366,8 @@ impl ProxyManager {
         Ok(Some(
             json!({"node_id":b.node_id,"node_name":n.map(|n|&n.original_name),"subscription_name":sub.map(|s|&s.name),"listener_port":b.listener_port,"revision":b.revision,"generation":s.generation,
             "status":if self.router.applying.load(Ordering::SeqCst){"applying"}else if reason.is_some(){"blocked"}else{"active"},"reason":reason,
+            "automatic_reason":b.automatic_reason,"previous_node_id":b.previous_node_id,"updated_at":b.updated_at,
+            "auto_failover_pending":self.config().auto_failover_enabled && !s.route_active(b),
             "test_status":n.map(|n|n.test_status()),"delay_ms":n.and_then(|n|n.delay_ms),"delay_checked_at":n.and_then(|n|n.delay_checked_at),"delay_error_code":n.and_then(|n|n.delay_error_code.as_deref())}),
         ))
     }
@@ -437,10 +510,6 @@ impl ProxyManager {
     }
     async fn worker(self: Arc<Self>) {
         use std::collections::{HashMap, HashSet};
-        let limits = Limits::new(
-            self.config().subscription_concurrency,
-            self.config().manual_test_concurrency,
-        );
         let mut tasks = tokio::task::JoinSet::new();
         let mut active = HashMap::new();
         let mut resources = HashSet::new();
@@ -453,7 +522,7 @@ impl ProxyManager {
                         error.id()
                     }
                 };
-                if let Some((_, Some(resource))) = active.remove(&task_id) {
+                if let Some((_, Some(resource), _)) = active.remove(&task_id) {
                     resources.remove(&resource);
                 }
             }
@@ -468,7 +537,7 @@ impl ProxyManager {
                     .into_iter()
                     .filter(|op| op.phase == "queued")
                 {
-                    if active.values().any(|(id, _)| id == &op.id) {
+                    if active.values().any(|(id, _, _)| id == &op.id) {
                         continue;
                     }
                     let action = match self.decode_action(&op) {
@@ -482,19 +551,21 @@ impl ProxyManager {
                     if resource.as_ref().is_some_and(|key| resources.contains(key)) {
                         continue;
                     }
-                    let Some(permit) = limits.try_acquire(action.class()) else {
+                    let class = action.class();
+                    if active.values().filter(|(_, _, job)| *job == class).count()
+                        >= class.limit(&self.config())
+                    {
                         continue;
-                    };
+                    }
                     if let Some(resource) = &resource {
                         resources.insert(resource.clone());
                     }
                     let operation_id = op.id.clone();
                     let manager = self.clone();
                     let handle = tasks.spawn(async move {
-                        let _permit = permit;
                         manager.run_operation(op).await;
                     });
-                    active.insert(handle.id(), (operation_id, resource));
+                    active.insert(handle.id(), (operation_id, resource, class));
                 }
             }
             tokio::select! {_=self.wake.notified()=>{},_=tokio::time::sleep(scheduler::POLL_INTERVAL)=>{}}
@@ -527,6 +598,9 @@ impl ProxyManager {
             }
             self.fail_operation(&mut op, e).await;
         } else {
+            for account_id in self.router.snapshot().bindings.keys() {
+                let _ = self.store.cancel_auto_account(*account_id);
+            }
             let created = op
                 .result
                 .as_ref()
@@ -642,7 +716,11 @@ impl ProxyManager {
             let data = subscription::download(
                 std::str::from_utf8(&url)
                     .map_err(|_| error("subscription_invalid", "invalid subscription URL"))?,
-                &self.settings,
+                &{
+                    let mut settings = (*self.settings).clone();
+                    settings.proxy_manager = self.config();
+                    settings
+                },
             )
             .await?;
             Some((sub.revision, data))
@@ -659,10 +737,21 @@ impl ProxyManager {
                 "previous operation requires recovery",
             ));
         }
+        if let Action::UpdateSettings {
+            expected_revision,
+            settings,
+        } = &action
+        {
+            return self
+                .update_settings_locked(op, *expected_revision, settings)
+                .await;
+        }
         let old = self.router.snapshot();
         let mut next = old.clone();
         let mut delete_ids = Vec::new();
         match &action {
+            Action::UpdateSettings { .. } => unreachable!("handled above"),
+            Action::ReconcileBindings => self.reconcile_bindings(&mut next, op)?,
             Action::CreateSubscriptions { items } => {
                 if items.is_empty() || items.len() > 50 {
                     return Err(GatewayError::BadRequest(
@@ -846,7 +935,7 @@ impl ProxyManager {
                     .ok_or_else(|| GatewayError::NotFound("subscription does not exist".into()))?;
                 let (revision, data) = refresh_data.as_ref().expect("refresh data");
                 check_revision(sub.revision, *revision)?;
-                let nodes = subscription::parse(data, sub, &next, self.crypto()?, self.config())?;
+                let nodes = subscription::parse(data, sub, &next, self.crypto()?, &self.config())?;
                 next.replace_subscription_nodes(id, nodes);
                 if next.nodes.len() > 100_000 {
                     return Err(error(
@@ -897,36 +986,8 @@ impl ProxyManager {
                         message: "该节点尚未通过测试，请先测试通过后再选为代理出口。".into(),
                     });
                 }
-                let port = if let Some(b) = previous {
-                    b.listener_port
-                } else {
-                    let port = (self.config().port_start..=self.config().port_end)
-                        .find(|p| {
-                            !next.bindings.values().any(|b| b.listener_port == *p)
-                                && std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok()
-                        })
-                        .ok_or_else(|| {
-                            error(
-                                "proxy_port_exhausted",
-                                "no account listener port is available",
-                            )
-                        })?;
-                    self.store.reserve(port, account, &op.id)?;
-                    port
-                };
-                let revision = previous.map_or(1, |b| b.revision + 1);
-                let created = previous.map_or(now(), |b| b.created_at);
-                next.bindings.insert(
-                    account,
-                    Binding {
-                        account_id: account,
-                        node_id: node_id.clone(),
-                        listener_port: port,
-                        revision,
-                        created_at: created,
-                        updated_at: now(),
-                    },
-                );
+                let revision =
+                    self.assign_node(&mut next, account, node_id.clone(), &op.id, None)?;
                 op.revision = Some(revision);
             }
             Action::DeleteBinding {
@@ -934,11 +995,14 @@ impl ProxyManager {
                 expected_revision,
             } => {
                 let account = self.account_id(email)?;
-                let b = next
-                    .bindings
-                    .get(&account)
-                    .ok_or_else(|| GatewayError::NotFound("account has no binding".into()))?;
-                check_revision(b.revision, *expected_revision)?;
+                if let Some(binding) = next.bindings.get(&account) {
+                    check_revision(binding.revision, *expected_revision)?;
+                } else if self.store.pending_auto_accounts()?.contains(&account) {
+                    check_revision(0, *expected_revision)?;
+                } else {
+                    return Err(GatewayError::NotFound("account has no binding".into()));
+                }
+                op.result = Some(json!({"auto_assignment_cancelled":account}));
                 next.bindings.remove(&account);
             }
             Action::DeleteAccounts { ids } => {
@@ -1135,6 +1199,9 @@ impl ProxyManager {
                             .await;
                     }
                 }
+                if let Err(error) = self.automation_tick().await {
+                    tracing::warn!(%error,"proxy automation deferred");
+                }
             }
         }
     }
@@ -1160,6 +1227,8 @@ impl ProxyManager {
     }
     async fn execute_test(&self, op: &mut Operation, node_id: &str) -> Result<(), GatewayError> {
         let control = self.control_gate.read().await;
+        let settings_revision = self.settings_view().revision;
+        let cfg = self.config();
         if self.stopping.load(Ordering::SeqCst) || !self.router.ready() {
             return Err(error("proxy_unavailable", "core is unavailable"));
         }
@@ -1196,13 +1265,14 @@ impl ProxyManager {
         ))
         .unwrap();
         url.query_pairs_mut()
-            .append_pair("url", &self.config().manual_test_url)
-            .append_pair("timeout", &self.config().manual_test_timeout_ms.to_string());
+            .append_pair("url", &cfg.manual_test_url)
+            .append_pair("timeout", &cfg.manual_test_timeout_ms.to_string());
         let outcome = controller
-            .api(
+            .api_with_timeout(
                 reqwest::Method::GET,
                 &format!("{}?{}", url.path(), url.query().unwrap()),
                 None,
+                Duration::from_millis(cfg.manual_test_timeout_ms.saturating_add(1000)),
             )
             .await;
         let checked_at = now();
@@ -1212,6 +1282,7 @@ impl ProxyManager {
         let mut next = self.router.snapshot();
         if self.stopping.load(Ordering::SeqCst)
             || !self.router.ready()
+            || settings_revision != self.settings_view().revision
             || generation != next.generation
             || core_epoch != self.router.core_epoch()
         {
@@ -1436,7 +1507,14 @@ fn runtime_signature(s: &Snapshot) -> Value {
     let bindings = s
         .bindings
         .values()
-        .map(|b| (b.account_id, &b.node_id, b.listener_port, s.route_active(b)))
+        .map(|b| {
+            (
+                b.account_id,
+                &b.node_id,
+                b.listener_port,
+                s.route_configured(b),
+            )
+        })
         .collect::<Vec<_>>();
     json!([nodes, bindings])
 }
@@ -1481,7 +1559,7 @@ mod tests {
     use super::*;
     use base64::Engine;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    fn queued_manager(downloads: usize, tests: usize) -> Arc<ProxyManager> {
+    pub(super) fn queued_manager(downloads: usize, tests: usize) -> Arc<ProxyManager> {
         let state = crate::server::state::compact_test_state();
         let mut settings = (*state.settings).clone();
         settings.proxy_manager.enabled = true;
@@ -1502,7 +1580,7 @@ mod tests {
         manager.started.store(true, Ordering::SeqCst);
         manager
     }
-    async fn fixture_snapshot(manager: &Arc<ProxyManager>, url: &str, count: usize) {
+    pub(super) async fn fixture_snapshot(manager: &Arc<ProxyManager>, url: &str, count: usize) {
         use super::super::model::test_data::{node, subscription};
         let mut snapshot = Snapshot::default();
         for i in 0..count {
@@ -1894,7 +1972,7 @@ mod tests {
             super::super::model::test_data::binding(account_id, "node3"),
         );
         manager.router.publish_metadata(snapshot);
-        *manager.core.lock().await = Some(Core::new(manager.config()).unwrap());
+        *manager.core.lock().await = Some(Core::new(&manager.config()).unwrap());
         let single = manager
             .enqueue(
                 Action::TestNode { id: "node0".into() },
@@ -2058,6 +2136,8 @@ mod tests {
         settings.proxy_manager.port_start = port;
         settings.proxy_manager.port_end = port;
         settings.proxy_manager.apply_drain_timeout_secs = 1;
+        settings.proxy_manager.auto_test_enabled = false;
+        settings.proxy_manager.auto_failover_enabled = false;
         let crypto =
             Crypto::from_base64(&base64::engine::general_purpose::STANDARD.encode([42u8; 32]))
                 .unwrap();
@@ -2124,8 +2204,13 @@ mod tests {
             true,
             Duration::from_secs(2),
         ));
+        let preferences = SettingsRecord {
+            revision: 0,
+            settings: ProxySettings::from_config(&settings.proxy_manager),
+        };
         let manager = Arc::new(ProxyManager {
             settings,
+            preferences: std::sync::RwLock::new(preferences),
             store,
             crypto: Some(crypto),
             router,
@@ -2360,3 +2445,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "automation_tests.rs"]
+mod automation_tests;

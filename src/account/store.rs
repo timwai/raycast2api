@@ -266,6 +266,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS proxy_auto_accounts (
+    account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL
+);
 ";
 
 /// 既有库的增量迁移:旧 schema 没有 `cooldown_until` / `has_pro_features`
@@ -403,6 +407,13 @@ impl AccountStore {
         &self,
         records: &[AccountRecord],
     ) -> Result<Vec<UpsertOutcome>, GatewayError> {
+        self.upsert_batch_with_auto_binding(records, false)
+    }
+    pub(crate) fn upsert_batch_with_auto_binding(
+        &self,
+        records: &[AccountRecord],
+        auto_bind: bool,
+    ) -> Result<Vec<UpsertOutcome>, GatewayError> {
         let prepared = records
             .iter()
             .enumerate()
@@ -442,7 +453,12 @@ impl AccountStore {
                 prepared
                     .iter()
                     .map(|(record, email, priority)| {
-                        upsert_tx(conn, record, email, *priority, &now)
+                        let outcome = upsert_tx(conn, record, email, *priority, &now)?;
+                        if auto_bind && outcome == UpsertOutcome::Inserted {
+                            diesel::sql_query("INSERT OR IGNORE INTO proxy_auto_accounts(account_id,created_at) SELECT id,? FROM accounts WHERE email=?")
+                                .bind::<Text,_>(&now).bind::<Text,_>(email).execute(conn)?;
+                        }
+                        Ok(outcome)
                     })
                     .collect()
             })

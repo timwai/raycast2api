@@ -1,4 +1,5 @@
 const mutations = new Set([
+    'settings/update',
     'subscriptions/create', 'subscriptions/create-batch', 'subscriptions/update',
     'subscriptions/delete', 'subscriptions/refresh', 'subscriptions/refresh-all',
     'nodes/test', 'nodes/test-batch', 'nodes/test-all', 'bindings/set', 'bindings/delete'

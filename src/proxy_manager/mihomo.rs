@@ -30,10 +30,21 @@ impl Controller {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, GatewayError> {
+        self.api_with_timeout(method, path, body, Duration::from_secs(10))
+            .await
+    }
+    pub async fn api_with_timeout(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, GatewayError> {
         let mut request = self
             .http
             .request(method, format!("http://{}{}", self.address, path))
-            .bearer_auth(&self.secret);
+            .bearer_auth(&self.secret)
+            .timeout(timeout);
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -161,7 +172,7 @@ impl Core {
         let mut listeners = Vec::new();
         for b in state.bindings.values() {
             let group = format!("rp_acc_{}", b.account_id);
-            groups.push(if state.route_active(b){
+            groups.push(if state.route_configured(b){
                 let n=&state.nodes[&b.node_id];json!({"name":group,"type":"select","use":[format!("rp_sub_{}",n.subscription_id)],"filter":format!("^{}$",n.mihomo_name),"default-selected":n.mihomo_name,"empty-fallback":"REJECT","interval":0})
             }else{json!({"name":group,"type":"select","proxies":["REJECT"],"default-selected":"REJECT","empty-fallback":"REJECT","interval":0})});
             listeners.push(json!({"name":format!("rp_listener_{}",b.account_id),"type":"mixed","listen":"127.0.0.1","port":b.listener_port,"proxy":group}));
@@ -309,7 +320,7 @@ impl Core {
                     None,
                 )
                 .await?;
-            let expected = if state.route_active(b) {
+            let expected = if state.route_configured(b) {
                 state.nodes[&b.node_id].mihomo_name.as_str()
             } else {
                 "REJECT"

@@ -39,6 +39,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS proxy_nodes(id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL REFERENCES proxy_subscriptions(id) ON DELETE RESTRICT, identity_key TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(subscription_id,identity_key));
             CREATE TABLE IF NOT EXISTS account_proxy_bindings(account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, node_id TEXT NOT NULL REFERENCES proxy_nodes(id) ON DELETE RESTRICT, listener_port INTEGER NOT NULL UNIQUE, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS proxy_runtime(id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS proxy_preferences(key TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS proxy_auto_accounts(account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, created_at INTEGER NOT NULL);
             INSERT OR IGNORE INTO proxy_runtime(id,generation) VALUES(1,0);
             CREATE TABLE IF NOT EXISTS proxy_apply_operations(id TEXT PRIMARY KEY, phase TEXT NOT NULL, idempotency_key TEXT UNIQUE, request_hash TEXT, payload TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS proxy_operations_phase ON proxy_apply_operations(phase);
@@ -67,6 +69,62 @@ impl Store {
               AND NOT EXISTS (SELECT 1 FROM account_proxy_bindings WHERE node_id = proxy_nodes.id);")
             .map_err(|_| "failed to clean up stale unbound proxy nodes".to_string())?;
         Ok(Self { db })
+    }
+    pub(super) fn preference<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, GatewayError> {
+        let row = diesel::sql_query("SELECT payload FROM proxy_preferences WHERE key=?")
+            .bind::<Text, _>(key)
+            .get_result::<Payload>(&mut *self.db.lock())
+            .optional()
+            .map_err(db_error)?;
+        row.map(|row| decode(&row.payload)).transpose()
+    }
+    pub(super) fn save_preference<T: serde::Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), GatewayError> {
+        diesel::sql_query("INSERT INTO proxy_preferences(key,payload) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload")
+            .bind::<Text,_>(key).bind::<Text,_>(encode(value)?).execute(&mut *self.db.lock()).map_err(db_error)?;
+        Ok(())
+    }
+    pub(super) fn pending_auto_accounts(&self) -> Result<Vec<i64>, GatewayError> {
+        Ok(diesel::sql_query(
+            "SELECT account_id AS id FROM proxy_auto_accounts ORDER BY account_id",
+        )
+        .load::<AccountId>(&mut *self.db.lock())
+        .map_err(db_error)?
+        .into_iter()
+        .map(|row| row.id)
+        .collect())
+    }
+    pub(super) fn cancel_auto_account(&self, id: i64) -> Result<(), GatewayError> {
+        diesel::sql_query("DELETE FROM proxy_auto_accounts WHERE account_id=?")
+            .bind::<BigInt, _>(id)
+            .execute(&mut *self.db.lock())
+            .map_err(db_error)?;
+        Ok(())
+    }
+    pub(super) fn account_labels(
+        &self,
+    ) -> Result<std::collections::BTreeMap<i64, String>, GatewayError> {
+        #[derive(QueryableByName)]
+        struct Label {
+            #[diesel(sql_type=BigInt)]
+            id: i64,
+            #[diesel(sql_type=Text)]
+            email: String,
+        }
+        Ok(
+            diesel::sql_query("SELECT id,email FROM accounts ORDER BY id")
+                .load::<Label>(&mut *self.db.lock())
+                .map_err(db_error)?
+                .into_iter()
+                .map(|row| (row.id, row.email))
+                .collect(),
+        )
     }
     pub fn load(&self) -> Result<Snapshot, GatewayError> {
         crate::storage::db::blocking(|| {
@@ -245,6 +303,9 @@ impl Store {
             self.db.lock().immediate_transaction::<_,StorageFailure,_>(|db|{
             db.batch_execute("DELETE FROM account_proxy_bindings; DELETE FROM proxy_nodes; DELETE FROM proxy_subscriptions;").map_err(db_error)?;
             for id in delete_ids { diesel::sql_query("DELETE FROM accounts WHERE id=?").bind::<BigInt,_>(id).execute(db).map_err(db_error)?; }
+            if let Some(id)=op.result.as_ref().and_then(|r|r["auto_assignment_cancelled"].as_i64()) {
+                diesel::sql_query("DELETE FROM proxy_auto_accounts WHERE account_id=?").bind::<BigInt,_>(id).execute(db)?;
+            }
             for sub in state.subscriptions.values(){
                 diesel::sql_query("INSERT INTO proxy_subscriptions(id,payload) VALUES(?,?)").bind::<Text,_>(&sub.id).bind::<Text,_>(encode(sub)?).execute(db).map_err(db_error)?;
             }
@@ -263,6 +324,27 @@ impl Store {
             Ok(())
         }).map_err(|_| error("proxy_storage_failed","proxy database transaction failed"))
         })
+    }
+    pub(super) fn commit_settings(
+        &self,
+        state: &Snapshot,
+        op: &Operation,
+        settings: &super::settings::SettingsRecord,
+        schedule: &super::settings::TestSchedule,
+    ) -> Result<(), GatewayError> {
+        self.db.lock().immediate_transaction::<_,StorageFailure,_>(|db| {
+            for node in state.nodes.values() {
+                diesel::sql_query("UPDATE proxy_nodes SET payload=? WHERE id=?")
+                    .bind::<Text,_>(encode(node)?).bind::<Text,_>(&node.id).execute(db)?;
+            }
+            for (key, payload) in [("settings",encode(settings)?),("test_schedule",encode(schedule)?)] {
+                diesel::sql_query("INSERT INTO proxy_preferences(key,payload) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload")
+                    .bind::<Text,_>(key).bind::<Text,_>(payload).execute(db)?;
+            }
+            diesel::sql_query("UPDATE proxy_apply_operations SET phase=?,payload=? WHERE id=?")
+                .bind::<Text,_>(&op.phase).bind::<Text,_>(encode(op)?).bind::<Text,_>(&op.id).execute(db)?;
+            Ok(())
+        }).map_err(|_|error("proxy_storage_failed","could not persist proxy settings"))
     }
     pub fn reserve(&self, port: u16, account: i64, operation: &str) -> Result<(), GatewayError> {
         diesel::sql_query(

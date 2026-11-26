@@ -111,3 +111,11 @@ test('account cards warn about a failed bound proxy and clear the warning after 
     card.account.proxy_binding = null;
     assert.doesNotMatch(renderedText(card.render()), /代理节点测试失败/);
 });
+
+test('account cards show subscription and node together with an automatic transfer notice',()=>{
+    const card=mount('account-card');
+    card.account={email:'bound@fixture',available:true,proxy_binding:{subscription_name:'订阅甲',node_name:'香港 01',status:'active',automatic_reason:'failover',updated_at:100}};
+    const text=renderedText(card.render());assert.match(text,/订阅甲 \/ 香港 01/);assert.match(text,/已自动转移出口/);
+    card.account.proxy_binding={node_name:'等待分配',status:'pending'};
+    assert.match(renderedText(card.render()),/等待分配测试通过的空闲节点/);
+});

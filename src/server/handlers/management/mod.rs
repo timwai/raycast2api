@@ -18,6 +18,11 @@ use crate::server::state::SharedState;
 /// Session/API-key-protected routes, relative to /v1; login is public.
 pub(crate) fn routes() -> Router<SharedState> {
     Router::new()
+        .route(
+            "/proxy/settings",
+            get(proxy::settings).post(proxy::settings),
+        )
+        .route("/proxy/settings/update", post(proxy::update_settings))
         .route("/proxy/subscriptions/list", post(proxy::subscriptions))
         .route("/proxy/subscriptions/create", post(proxy::create))
         .route(
